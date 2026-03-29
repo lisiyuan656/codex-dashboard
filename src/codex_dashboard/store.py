@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 import uuid
 
@@ -11,6 +11,14 @@ from sqlalchemy.orm import Session
 from .config import Settings
 from .models import Agent, ApprovalRequest, Session as ManagedSession, SessionEvent, SessionLock, User, utcnow
 from .security import hash_password, verify_password
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def ensure_default_admin(db: Session, settings: Settings) -> None:
@@ -36,13 +44,15 @@ def refresh_staleness(db: Session, settings: Settings) -> None:
     session_cutoff = now - timedelta(seconds=settings.stale_session_seconds)
 
     for agent in db.scalars(select(Agent)).all():
-        agent.status = "online" if agent.last_seen_at and agent.last_seen_at >= agent_cutoff else "offline"
+        last_seen_at = _as_utc(agent.last_seen_at)
+        agent.status = "online" if last_seen_at and last_seen_at >= agent_cutoff else "offline"
 
     active_states = {"launching", "running", "idle", "awaiting_approval", "stale"}
     for session in db.scalars(select(ManagedSession).where(ManagedSession.state.in_(active_states))).all():
         if session.state in {"finished", "failed", "stopped"}:
             continue
-        if session.last_heartbeat_at and session.last_heartbeat_at >= session_cutoff:
+        last_heartbeat_at = _as_utc(session.last_heartbeat_at)
+        if last_heartbeat_at and last_heartbeat_at >= session_cutoff:
             if session.state == "stale":
                 session.state = "running"
         elif session.source == "managed":

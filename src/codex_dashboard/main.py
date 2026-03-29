@@ -66,7 +66,7 @@ def create_app() -> FastAPI:
 
     @app.get("/login", response_class=HTMLResponse)
     def login_page(request: Request) -> HTMLResponse:
-        return templates.TemplateResponse("login.html", {"request": request})
+        return templates.TemplateResponse(request, "login.html", {})
 
     @app.post("/api/login")
     async def login(request: Request, db: Session = Depends(get_db)) -> JSONResponse:
@@ -87,9 +87,9 @@ def create_app() -> FastAPI:
         del user
         refresh_staleness(db, settings)
         return templates.TemplateResponse(
+            request,
             "index.html",
             {
-                "request": request,
                 "agents": list_agents_with_sessions(db),
                 "hub": hub,
             },
@@ -108,9 +108,9 @@ def create_app() -> FastAPI:
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
         return templates.TemplateResponse(
+            request,
             "agent.html",
             {
-                "request": request,
                 "agent": agent,
                 "sessions": get_agent_sessions(db, agent_id),
                 "connected": hub.is_agent_connected(agent_id),
@@ -128,9 +128,9 @@ def create_app() -> FastAPI:
         if detail is None:
             raise HTTPException(status_code=404, detail="Session not found")
         return templates.TemplateResponse(
+            request,
             "session.html",
             {
-                "request": request,
                 "detail": detail,
                 "user": user,
             },
