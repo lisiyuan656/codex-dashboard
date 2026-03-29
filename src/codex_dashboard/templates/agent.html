@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <div class="toolbar">
+    <h1 style="margin: 0;">{{ agent.display_name }}</h1>
+    <span class="pill status-{{ agent.status }}">{{ agent.status }}</span>
+    <span class="pill">{{ "connected" if connected else "disconnected" }}</span>
+  </div>
+  <p class="meta">{{ agent.hostname }}</p>
+  <div class="inline-list">
+    {% for label in agent.labels %}
+    <span class="pill">{{ label }}</span>
+    {% endfor %}
+  </div>
+  <pre class="session-output" style="min-height: 120px;">{{ agent.meta | tojson(indent=2) }}</pre>
+</div>
+
+<div class="card" style="margin-top: 1rem;">
+  <h2>Launch Managed Session</h2>
+  <form id="launch-form">
+    <label>
+      Name
+      <input name="name" value="Managed Codex Session">
+    </label>
+    <label>
+      Working directory
+      <input name="cwd" value=".">
+    </label>
+    <label>
+      Command
+      <input name="command" value="codex --no-alt-screen">
+    </label>
+    <button type="submit">Launch</button>
+    <div id="launch-error" class="error"></div>
+  </form>
+</div>
+
+<div class="card" style="margin-top: 1rem;">
+  <h2>Recent Sessions</h2>
+  <div class="grid">
+    {% for session in sessions %}
+    <div class="card">
+      <div class="toolbar">
+        <strong>{{ session.name }}</strong>
+        <span class="pill status-{{ session.state }}">{{ session.state }}</span>
+        <span class="pill">{{ session.source }}</span>
+      </div>
+      <div class="meta">{{ session.command }}</div>
+      <div class="meta">{{ session.started_at }}</div>
+      <a href="/sessions/{{ session.id }}">Open session</a>
+    </div>
+    {% else %}
+    <p class="meta">No sessions yet.</p>
+    {% endfor %}
+  </div>
+</div>
+
+<script>
+  document.getElementById("launch-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.target);
+    const response = await fetch("/api/agents/{{ agent.id }}/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: form.get("name"),
+        cwd: form.get("cwd"),
+        command: form.get("command"),
+      }),
+    });
+    const payload = await response.json();
+    if (response.ok) {
+      window.location.href = `/sessions/${payload.session_id}`;
+      return;
+    }
+    document.getElementById("launch-error").textContent = payload.detail || "Launch failed";
+  });
+</script>
+{% endblock %}

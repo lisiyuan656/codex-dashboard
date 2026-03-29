@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card" style="max-width: 420px; margin: 2rem auto;">
+  <h1>Log In</h1>
+  <p class="meta">Use the configured dashboard credentials.</p>
+  <form id="login-form">
+    <label>
+      Username
+      <input name="username" value="admin" autocomplete="username">
+    </label>
+    <label>
+      Password
+      <input type="password" name="password" autocomplete="current-password">
+    </label>
+    <button type="submit">Enter Dashboard</button>
+    <div id="login-error" class="error"></div>
+  </form>
+</div>
+<script>
+  document.getElementById("login-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.target);
+    const response = await fetch("/api/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        username: form.get("username"),
+        password: form.get("password"),
+      }),
+    });
+    if (response.ok) {
+      window.location.href = "/";
+      return;
+    }
+    const payload = await response.json();
+    document.getElementById("login-error").textContent = payload.detail || "Login failed";
+  });
+</script>
+{% endblock %}

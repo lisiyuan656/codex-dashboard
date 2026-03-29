@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex Dashboard Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CODEX_DASHBOARD_AGENT_WS_URL=ws://127.0.0.1:8000/ws/agent
+Environment=CODEX_DASHBOARD_AGENT_TOKEN=change-me
+ExecStart=/usr/bin/env codex-dashboard-agent
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

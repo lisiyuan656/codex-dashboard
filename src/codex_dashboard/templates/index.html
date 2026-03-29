@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div class="pill">Agents: {{ agents|length }}</div>
+</div>
+
+<div class="grid agent-grid">
+  {% for agent in agents %}
+  <article class="card">
+    <div class="toolbar">
+      <h2 style="margin: 0;">{{ agent.display_name }}</h2>
+      <span class="pill status-{{ agent.status }}">{{ agent.status }}</span>
+    </div>
+    <p class="meta">{{ agent.hostname }}</p>
+    <div class="inline-list">
+      {% for label in agent.labels %}
+      <span class="pill">{{ label }}</span>
+      {% endfor %}
+    </div>
+    <p class="meta">Last seen: {{ agent.last_seen_at or "never" }}</p>
+    <p class="meta">Connected: {{ "yes" if hub.is_agent_connected(agent.id) else "no" }}</p>
+    <p><a href="/agents/{{ agent.id }}">Open machine</a></p>
+    <div class="grid">
+      {% for session in agent.sessions %}
+      <div class="card">
+        <div class="toolbar">
+          <strong>{{ session.name }}</strong>
+          <span class="pill status-{{ session.state }}">{{ session.state }}</span>
+        </div>
+        <div class="meta">{{ session.command }}</div>
+        <a href="/sessions/{{ session.id }}">View session</a>
+      </div>
+      {% else %}
+      <p class="meta">No sessions recorded yet.</p>
+      {% endfor %}
+    </div>
+  </article>
+  {% endfor %}
+</div>
+{% endblock %}

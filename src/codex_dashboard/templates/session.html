@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+{% set session = detail.session %}
+{% block content %}
+<div class="card">
+  <div class="toolbar">
+    <h1 style="margin: 0;">{{ session.name }}</h1>
+    <span class="pill status-{{ session.state }}">{{ session.state }}</span>
+    <span class="pill">{{ session.source }}</span>
+  </div>
+  <p class="meta">{{ session.command }}</p>
+  <p class="meta">CWD: {{ session.cwd }}</p>
+  <p class="meta">Agent: <a href="/agents/{{ session.agent_id }}">{{ session.agent_id }}</a></p>
+  <p class="meta">PID: {{ session.pid or "n/a" }}</p>
+  <p class="meta">Exit: {{ session.exit_code if session.exit_code is not none else "running" }}</p>
+</div>
+
+<div class="card" style="margin-top: 1rem;">
+  <div class="toolbar">
+    <button type="button" id="lock-button">{{ "Acquire Lock" if not detail.lock or detail.lock.user_id != user.id else "Release Lock" }}</button>
+    {% if session.source == "managed" %}
+    <button type="button" id="approve-button" class="secondary">Approve</button>
+    <button type="button" id="deny-button" class="secondary">Deny</button>
+    <button type="button" id="stop-button" class="danger">Stop</button>
+    {% endif %}
+    <span class="pill" id="lock-state">
+      {% if detail.lock %}
+      locked by user {{ detail.lock.user_id }}
+      {% else %}
+      unlocked
+      {% endif %}
+    </span>
+  </div>
+
+  <div class="toolbar">
+    <input id="input-box" placeholder="Send text or commands to the managed session" {% if session.source != "managed" %}disabled{% endif %}>
+    <button type="button" id="send-button" {% if session.source != "managed" %}disabled{% endif %}>Send</button>
+  </div>
+
+  <pre id="session-output" class="session-output">{{ session.last_output_excerpt or "" }}</pre>
+</div>
+
+<div class="card" style="margin-top: 1rem;">
+  <h2>Approvals</h2>
+  <div class="grid">
+    {% for approval in detail.approvals %}
+    <div class="card">
+      <div class="toolbar">
+        <strong>{{ approval.status }}</strong>
+        <span class="pill">{{ approval.created_at }}</span>
+      </div>
+      <pre class="session-output" style="min-height: 120px;">{{ approval.prompt }}</pre>
+    </div>
+    {% else %}
+    <p class="meta">No approvals recorded.</p>
+    {% endfor %}
+  </div>
+</div>
+
+<div class="card" style="margin-top: 1rem;">
+  <h2>Timeline</h2>
+  <div class="grid" id="event-list">
+    {% for event in detail.events[-20:] %}
+    <div class="card">
+      <div class="toolbar">
+        <strong>{{ event.event_type }}</strong>
+        <span class="pill">{{ event.created_at }}</span>
+      </div>
+      <pre class="session-output" style="min-height: 80px;">{{ event.payload | tojson(indent=2) }}</pre>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+
+<script>
+  const sessionId = "{{ session.id }}";
+  const sessionOutput = document.getElementById("session-output");
+  const eventList = document.getElementById("event-list");
+  const lockState = document.getElementById("lock-state");
+  const lockButton = document.getElementById("lock-button");
+  const inputBox = document.getElementById("input-box");
+
+  function appendOutput(text) {
+    sessionOutput.textContent += text;
+    sessionOutput.scrollTop = sessionOutput.scrollHeight;
+  }
+
+  function prependEvent(title, payload) {
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = `
+      <div class="toolbar">
+        <strong>${title}</strong>
+        <span class="pill">${new Date().toISOString()}</span>
+      </div>
+      <pre class="session-output" style="min-height: 80px;">${JSON.stringify(payload, null, 2)}</pre>
+    `;
+    eventList.prepend(card);
+  }
+
+  async function postJson(url, payload) {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.detail || "Request failed");
+    }
+    return data;
+  }
+
+  lockButton.addEventListener("click", async () => {
+    const action = lockButton.textContent.includes("Release") ? "release" : "acquire";
+    try {
+      const payload = await postJson(`/api/sessions/${sessionId}/lock`, { action });
+      lockState.textContent = payload.message;
+      lockButton.textContent = action === "acquire" ? "Release Lock" : "Acquire Lock";
+    } catch (error) {
+      alert(error.message);
+    }
+  });
+
+  document.getElementById("send-button")?.addEventListener("click", async () => {
+    try {
+      const input = inputBox.value;
+      if (!input) return;
+      await postJson(`/api/sessions/${sessionId}/actions`, { type: "send_input", input: `${input}\n` });
+      prependEvent("input", { input });
+      inputBox.value = "";
+    } catch (error) {
+      alert(error.message);
+    }
+  });
+
+  document.getElementById("approve-button")?.addEventListener("click", async () => {
+    try {
+      await postJson(`/api/sessions/${sessionId}/actions`, { type: "approve" });
+    } catch (error) {
+      alert(error.message);
+    }
+  });
+
+  document.getElementById("deny-button")?.addEventListener("click", async () => {
+    try {
+      await postJson(`/api/sessions/${sessionId}/actions`, { type: "deny" });
+    } catch (error) {
+      alert(error.message);
+    }
+  });
+
+  document.getElementById("stop-button")?.addEventListener("click", async () => {
+    try {
+      await postJson(`/api/sessions/${sessionId}/actions`, { type: "stop_session" });
+    } catch (error) {
+      alert(error.message);
+    }
+  });
+
+  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${scheme}://${window.location.host}/ws/sessions/${sessionId}`);
+  socket.addEventListener("message", (event) => {
+    const payload = JSON.parse(event.data);
+    if (payload.type === "history_batch") {
+      return;
+    }
+    if (payload.type === "session_event") {
+      if (payload.event_type === "output" && payload.payload.text) {
+        appendOutput(payload.payload.text);
+      } else {
+        prependEvent(payload.event_type, payload.payload);
+      }
+      if (payload.summary) {
+        document.title = `${payload.summary.state} • {{ session.name }}`;
+      }
+    }
+    if (payload.type === "lock_changed") {
+      lockState.textContent = payload.message;
+    }
+  });
+</script>
+{% endblock %}
