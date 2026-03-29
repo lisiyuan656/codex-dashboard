@@ -26,6 +26,7 @@ dev = [
 [project.scripts]
 codex-dashboard-server = "codex_dashboard.main:run"
 codex-dashboard-agent = "codex_dashboard.agent.cli:main"
+codex-dashboard-cli = "codex_dashboard.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/codex_dashboard"]

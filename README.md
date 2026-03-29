@@ -44,6 +44,23 @@ uv run codex-dashboard-agent
 
 4. Open `http://127.0.0.1:8000`, log in as `admin`, and launch a managed session from an agent page.
 
+## CLI Launch
+
+You can also launch a managed session without the browser:
+
+```bash
+export CODEX_DASHBOARD_URL="http://127.0.0.1:8000"
+export CODEX_DASHBOARD_USERNAME="admin"
+export CODEX_DASHBOARD_PASSWORD="replace-me"
+uv run codex-dashboard-cli launch \
+  --agent workstation-omarchy \
+  --cwd /mnt/data/Projects/codex-dashboard \
+  --name "CLI Managed Session" \
+  --prompt "Inspect the repository and summarize the current dashboard architecture."
+```
+
+If you omit `--prompt`, the session starts idle. If you omit `--password`, the CLI will prompt for it.
+
 ## Configuration
 
 ### Server
