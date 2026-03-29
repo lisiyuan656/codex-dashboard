@@ -57,6 +57,10 @@ def refresh_staleness(db: Session, settings: Settings) -> None:
                 session.state = "running"
         elif session.source == "managed":
             session.state = "stale"
+        elif session.source == "unmanaged":
+            session.state = "stopped"
+            if session.ended_at is None:
+                session.ended_at = now
     db.commit()
 
 

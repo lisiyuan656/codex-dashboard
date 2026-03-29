@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterable
 import json
+from pathlib import Path
 import platform
 import shutil
 import socket
@@ -139,6 +140,7 @@ class DashboardAgent:
 
     def _discover_unmanaged_codex(self) -> Iterable[dict[str, Any]]:
         managed_pids = {session.process.pid for session in self.sessions.values() if session.process is not None}
+        codex_names = {Path(self.config.codex_bin).name}
         try:
             output = subprocess.check_output(["ps", "-eo", "pid=,comm=,args="], text=True)
         except Exception:
@@ -146,12 +148,14 @@ class DashboardAgent:
 
         discovered = []
         for line in output.splitlines():
-            if "codex" not in line:
-                continue
             parts = line.strip().split(None, 2)
             if len(parts) < 3:
                 continue
             pid = int(parts[0])
+            comm = parts[1]
+            args = parts[2]
+            if comm not in codex_names:
+                continue
             if pid in managed_pids:
                 continue
             discovered.append(
@@ -160,7 +164,7 @@ class DashboardAgent:
                     "source": "unmanaged",
                     "state": "detected",
                     "name": f"Unmanaged Codex {pid}",
-                    "command": parts[2],
+                    "command": args,
                     "cwd": ".",
                     "pid": pid,
                 }

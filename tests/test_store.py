@@ -86,3 +86,48 @@ def test_refresh_staleness_handles_sqlite_naive_datetimes() -> None:
     db.refresh(session)
     assert agent.status == "online"
     assert session.state == "running"
+
+
+def test_refresh_staleness_stops_stale_unmanaged_sessions() -> None:
+    db = make_db()
+    now = utcnow()
+    agent = Agent(
+        id="agent-2",
+        display_name="Agent Two",
+        hostname="host",
+        status="online",
+        last_seen_at=(now - timedelta(seconds=5)).replace(tzinfo=None),
+        labels=[],
+        meta={},
+    )
+    session = ManagedSession(
+        id="session-2",
+        agent_id="agent-2",
+        source="unmanaged",
+        name="Unmanaged",
+        state="running",
+        command="codex",
+        cwd=".",
+        last_heartbeat_at=(now - timedelta(seconds=120)).replace(tzinfo=None),
+        meta={},
+    )
+    db.add(agent)
+    db.add(session)
+    db.commit()
+
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        secret_key="secret",
+        session_cookie_name="cookie",
+        admin_username="admin",
+        admin_password="password",
+        agent_shared_secret="token",
+        offline_agent_seconds=60,
+        stale_session_seconds=45,
+    )
+
+    refresh_staleness(db, settings)
+
+    db.refresh(session)
+    assert session.state == "stopped"
+    assert session.ended_at is not None
