@@ -48,6 +48,13 @@ def _is_authenticated(request: Request, db: Session) -> bool:
     return get_websocket_user({"session": request.session}, db) is not None
 
 
+def _transport_for(session: Any) -> str:
+    meta = session.meta or {}
+    if session.source == "unmanaged":
+        return "unmanaged"
+    return meta.get("transport", "app_server")
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Codex Dashboard")
     app.add_middleware(SessionMiddleware, secret_key=settings.secret_key, session_cookie=settings.session_cookie_name)
@@ -107,12 +114,15 @@ def create_app() -> FastAPI:
         agent = get_agent_detail(db, agent_id)
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
+        sessions = get_agent_sessions(db, agent_id)
+        active_sessions = [item for item in sessions if item.state not in {"finished", "failed", "stopped"}]
         return templates.TemplateResponse(
             request,
             "agent.html",
             {
                 "agent": agent,
-                "sessions": get_agent_sessions(db, agent_id),
+                "active_sessions": active_sessions,
+                "sessions": sessions,
                 "connected": hub.is_agent_connected(agent_id),
             },
         )
@@ -150,15 +160,20 @@ def create_app() -> FastAPI:
         if not initial_prompt:
             initial_prompt = payload.get("command", "").strip()
         cwd = payload.get("cwd", "").strip() or "."
+        launch_mode = payload.get("launch_mode", "terminal").strip() or "terminal"
+        if launch_mode not in {"terminal", "app_server"}:
+            raise HTTPException(status_code=400, detail="Unsupported launch mode")
+        argv = [str(item) for item in payload.get("argv", [])]
+        command = "codex app-server" if launch_mode == "app_server" else " ".join(["codex", "--no-alt-screen", *argv]).strip()
         session = create_pending_session(
             db,
             agent_id=agent_id,
             user_id=user.id,
             source="managed",
             name=payload.get("name", "Managed Codex Session").strip() or "Managed Codex Session",
-            command="codex app-server",
+            command=command or "codex --no-alt-screen",
             cwd=cwd,
-            meta={"initial_prompt": initial_prompt},
+            meta={"transport": "app_server" if launch_mode == "app_server" else "tmux_terminal", "initial_prompt": initial_prompt, "argv": argv},
         )
         try:
             await hub.send_action(
@@ -169,6 +184,8 @@ def create_app() -> FastAPI:
                     "cwd": cwd,
                     "name": session.name,
                     "prompt": initial_prompt,
+                    "launch_mode": launch_mode,
+                    "argv": argv,
                 },
             )
         except RuntimeError as exc:
@@ -212,7 +229,13 @@ def create_app() -> FastAPI:
 
         payload = await request.json()
         action_type = payload.get("type")
-        if action_type not in {"send_input", "approve", "deny", "stop_session"}:
+        transport = _transport_for(session)
+        supported_actions = {"send_input", "stop_session"}
+        if transport == "tmux_terminal":
+            supported_actions |= {"send_enter", "interrupt_session"}
+        elif transport == "app_server":
+            supported_actions |= {"approve", "deny"}
+        if action_type not in supported_actions:
             raise HTTPException(status_code=400, detail="Unsupported action")
 
         action_payload: dict[str, Any] = {"type": action_type, "session_id": session_id}

@@ -26,6 +26,7 @@
         <div class="toolbar">
           <strong>{{ session.name }}</strong>
           <span class="pill status-{{ session.state }}">{{ session.state }}</span>
+          <span class="pill">{{ session.meta.get("transport", session.source) }}</span>
         </div>
         <div class="meta">{{ session.command }}</div>
         <a href="/sessions/{{ session.id }}">View session</a>

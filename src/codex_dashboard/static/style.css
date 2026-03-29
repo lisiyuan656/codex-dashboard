@@ -93,11 +93,11 @@ form {
   gap: 0.75rem;
 }
 
-input, textarea, button {
+input, textarea, button, select {
   font: inherit;
 }
 
-input, textarea {
+input, textarea, select {
   width: 100%;
   padding: 0.75rem;
   border-radius: 10px;

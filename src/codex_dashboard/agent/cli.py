@@ -15,6 +15,6 @@ def main() -> None:
     config = load_config()
     agent = DashboardAgent(config)
     if args.once:
-        asyncio.run(agent._run_once())
+        asyncio.run(agent.run_once())
         return
     asyncio.run(agent.run_forever())

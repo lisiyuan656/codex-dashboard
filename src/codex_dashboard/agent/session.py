@@ -3,17 +3,96 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 import json
-from typing import Any
+from pathlib import Path
+import shlex
+from typing import Any, Protocol
 
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+class SessionRuntime(Protocol):
+    session_id: str
+    name: str
+    cwd: str
+    command: str
+    transport: str
+    state: str
+
+    @property
+    def pid(self) -> int | None: ...
+
+    @property
+    def is_alive(self) -> bool: ...
+
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
+
+    async def send_input(self, text: str) -> None: ...
+
+    async def send_enter(self) -> None: ...
+
+    async def interrupt(self) -> None: ...
+
+    async def resolve_approval(self, *, approved: bool, approval_id: str) -> None: ...
+
+    async def emit_heartbeat(self) -> None: ...
+
+    async def sync(self) -> None: ...
+
+    def discovery_pids(self) -> set[int]: ...
+
+    def discovery_ttys(self) -> set[str]: ...
+
+
+class ManagedSessionBase:
+    transport = "managed"
+
+    def __init__(self, *, session_id: str, name: str, cwd: str, emit: EventCallback) -> None:
+        self.session_id = session_id
+        self.name = name
+        self.cwd = cwd
+        self.emit = emit
+        self.state = "launching"
+
+    @property
+    def pid(self) -> int | None:
+        return None
+
+    @property
+    def is_alive(self) -> bool:
+        return self.state not in {"stopped", "finished", "failed"}
+
+    async def send_enter(self) -> None:
+        raise RuntimeError(f"{self.transport} sessions do not support send_enter")
+
+    async def interrupt(self) -> None:
+        raise RuntimeError(f"{self.transport} sessions do not support interrupt")
+
+    async def resolve_approval(self, *, approved: bool, approval_id: str) -> None:
+        raise RuntimeError(f"{self.transport} sessions do not support approvals")
+
+    async def emit_heartbeat(self) -> None:
+        return None
+
+    async def sync(self) -> None:
+        return None
+
+    def discovery_pids(self) -> set[int]:
+        return {self.pid} if self.pid is not None else set()
+
+    def discovery_ttys(self) -> set[str]:
+        return set()
 
 
 class AppServerProtocolError(RuntimeError):
     pass
 
 
-class AppServerSession:
+class AppServerSession(ManagedSessionBase):
+    transport = "app_server"
+
     def __init__(
         self,
         *,
@@ -24,16 +103,13 @@ class AppServerSession:
         codex_bin: str,
         emit: EventCallback,
     ) -> None:
-        self.session_id = session_id
-        self.name = name
-        self.cwd = cwd
+        super().__init__(session_id=session_id, name=name, cwd=cwd, emit=emit)
         self.initial_prompt = initial_prompt
         self.codex_bin = codex_bin
-        self.emit = emit
+        self.command = f"{self.codex_bin} app-server"
         self.process: asyncio.subprocess.Process | None = None
         self.thread_id: str | None = None
         self.active_turn_id: str | None = None
-        self.state = "launching"
         self._request_id = 1
         self._write_lock = asyncio.Lock()
         self._pending_requests: dict[int, asyncio.Future[Any]] = {}
@@ -41,6 +117,14 @@ class AppServerSession:
         self._stdout_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._wait_task: asyncio.Task[None] | None = None
+
+    @property
+    def pid(self) -> int | None:
+        return self.process.pid if self.process is not None else None
+
+    @property
+    def is_alive(self) -> bool:
+        return self.process is not None and self.process.returncode is None
 
     async def start(self) -> None:
         self.process = await asyncio.create_subprocess_exec(
@@ -84,13 +168,14 @@ class AppServerSession:
                 "event_type": "started",
                 "session_id": self.session_id,
                 "name": self.name,
-                "command": f"{self.codex_bin} app-server",
+                "command": self.command,
                 "cwd": self.cwd,
-                "pid": self.process.pid,
+                "pid": self.pid,
                 "source": "managed",
                 "repo_path": self.cwd,
                 "git_branch": ((thread.get("gitInfo") or {}).get("branch") if thread.get("gitInfo") else None),
                 "meta": {
+                    "transport": self.transport,
                     "thread_id": self.thread_id,
                     "initial_prompt": self.initial_prompt,
                 },
@@ -124,18 +209,7 @@ class AppServerSession:
         turn = result["turn"]
         self.active_turn_id = turn["id"]
         self.state = self._map_turn_status(turn.get("status"))
-        await self.emit(
-            {
-                "type": "session_event",
-                "event_type": "heartbeat",
-                "session_id": self.session_id,
-                "state": self.state,
-                "meta": {
-                    "thread_id": self.thread_id,
-                    "turn_id": self.active_turn_id,
-                },
-            }
-        )
+        await self.emit_heartbeat()
 
     async def stop(self) -> None:
         if self.process is None or self.process.returncode is not None:
@@ -152,6 +226,12 @@ class AppServerSession:
             except Exception:
                 pass
         self.process.terminate()
+
+    async def send_enter(self) -> None:
+        await self.send_input("")
+
+    async def interrupt(self) -> None:
+        await self.stop()
 
     async def resolve_approval(self, *, approved: bool, approval_id: str) -> None:
         request = self._pending_server_requests.pop(approval_id, None)
@@ -180,6 +260,55 @@ class AppServerSession:
                 "session_id": self.session_id,
                 "approval_id": approval_id,
                 "status": "approved" if approved else "denied",
+                "meta": {
+                    "transport": self.transport,
+                },
+            }
+        )
+
+    async def emit_heartbeat(self) -> None:
+        await self.emit(
+            {
+                "type": "session_event",
+                "event_type": "heartbeat",
+                "session_id": self.session_id,
+                "state": self.state,
+                "name": self.name,
+                "command": self.command,
+                "cwd": self.cwd,
+                "pid": self.pid,
+                "source": "managed",
+                "meta": {
+                    "transport": self.transport,
+                    "thread_id": self.thread_id,
+                    "turn_id": self.active_turn_id,
+                },
+            }
+        )
+
+    async def sync(self) -> None:
+        if self.process is None:
+            return
+        if self.process.returncode is None:
+            await self.emit_heartbeat()
+            return
+        await self.emit(
+            {
+                "type": "session_event",
+                "event_type": "stopped" if self.process.returncode == 0 else "failed",
+                "session_id": self.session_id,
+                "state": "finished" if self.process.returncode == 0 else "failed",
+                "exit_code": self.process.returncode,
+                "name": self.name,
+                "command": self.command,
+                "cwd": self.cwd,
+                "pid": self.pid,
+                "source": "managed",
+                "meta": {
+                    "transport": self.transport,
+                    "thread_id": self.thread_id,
+                    "turn_id": self.active_turn_id,
+                },
             }
         )
 
@@ -209,6 +338,9 @@ class AppServerSession:
                     "session_id": self.session_id,
                     "text": f"[app-server stderr] {text}",
                     "state": self.state,
+                    "meta": {
+                        "transport": self.transport,
+                    },
                 }
             )
 
@@ -233,7 +365,13 @@ class AppServerSession:
                 "session_id": self.session_id,
                 "exit_code": code,
                 "state": state,
+                "name": self.name,
+                "command": self.command,
+                "cwd": self.cwd,
+                "pid": self.pid,
+                "source": "managed",
                 "meta": {
+                    "transport": self.transport,
                     "thread_id": self.thread_id,
                     "turn_id": self.active_turn_id,
                 },
@@ -280,6 +418,7 @@ class AppServerSession:
                     "prompt": self._format_approval_prompt(method, params),
                     "state": "awaiting_approval",
                     "meta": {
+                        "transport": self.transport,
                         "thread_id": params.get("threadId", self.thread_id),
                         "turn_id": params.get("turnId", self.active_turn_id),
                         "approval_method": method,
@@ -303,14 +442,14 @@ class AppServerSession:
 
         if method == "thread/status/changed":
             self.state = self._map_thread_status(params.get("status"))
-            await self._emit_heartbeat()
+            await self.emit_heartbeat()
             return
 
         if method == "turn/started":
             turn = params["turn"]
             self.active_turn_id = turn["id"]
             self.state = self._map_turn_status(turn.get("status"))
-            await self._emit_heartbeat()
+            await self.emit_heartbeat()
             return
 
         if method == "turn/completed":
@@ -325,9 +464,12 @@ class AppServerSession:
                         "session_id": self.session_id,
                         "text": f"[turn error] {turn['error'].get('message', 'unknown error')}\n",
                         "state": self.state,
+                        "meta": {
+                            "transport": self.transport,
+                        },
                     }
                 )
-            await self._emit_heartbeat()
+            await self.emit_heartbeat()
             return
 
         if method in {"item/agentMessage/delta", "item/commandExecution/outputDelta", "item/plan/delta"}:
@@ -341,6 +483,7 @@ class AppServerSession:
                         "text": text,
                         "state": self.state,
                         "meta": {
+                            "transport": self.transport,
                             "thread_id": params.get("threadId", self.thread_id),
                             "turn_id": params.get("turnId", self.active_turn_id),
                         },
@@ -367,6 +510,7 @@ class AppServerSession:
                     "text": f"[app-server error] {text}\n",
                     "state": self.state,
                     "meta": {
+                        "transport": self.transport,
                         "thread_id": params.get("threadId", self.thread_id),
                         "turn_id": params.get("turnId", self.active_turn_id),
                     },
@@ -382,26 +526,13 @@ class AppServerSession:
                     "session_id": self.session_id,
                     "state": self.state,
                     "meta": {
+                        "transport": self.transport,
                         "thread_id": params.get("threadId", self.thread_id),
                         "turn_id": params.get("turnId", self.active_turn_id),
                         "last_item_type": (params.get("item") or {}).get("type"),
                     },
                 }
             )
-
-    async def _emit_heartbeat(self) -> None:
-        await self.emit(
-            {
-                "type": "session_event",
-                "event_type": "heartbeat",
-                "session_id": self.session_id,
-                "state": self.state,
-                "meta": {
-                    "thread_id": self.thread_id,
-                    "turn_id": self.active_turn_id,
-                },
-            }
-        )
 
     async def _send_notification(self, method: str, params: dict[str, Any]) -> None:
         await self._write_json(
@@ -513,3 +644,304 @@ class AppServerSession:
             )
 
         return json.dumps(params, indent=2, sort_keys=True)
+
+
+class TmuxSessionError(RuntimeError):
+    pass
+
+
+class TmuxTerminalSession(ManagedSessionBase):
+    transport = "tmux_terminal"
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        name: str,
+        cwd: str,
+        codex_bin: str,
+        tmux_bin: str,
+        emit: EventCallback,
+        spool_dir: str,
+        argv: list[str] | None = None,
+        initial_prompt: str = "",
+    ) -> None:
+        super().__init__(session_id=session_id, name=name, cwd=cwd, emit=emit)
+        self.codex_bin = codex_bin
+        self.tmux_bin = tmux_bin
+        self.argv = list(argv or [])
+        self.initial_prompt = initial_prompt
+        self.command = shlex.join([self.codex_bin, "--no-alt-screen", *self.argv])
+        self.session_name = f"codexdash-{self.session_id[:12]}"
+        self.log_path = Path(spool_dir) / f"{self.session_id}.log"
+        self.repo_path: str | None = None
+        self.git_branch: str | None = None
+        self.pane_id: str | None = None
+        self.pane_tty: str | None = None
+        self._pid: int | None = None
+        self.attached_clients = 0
+        self.exit_code: int | None = None
+        self._log_offset = 0
+        self._log_task: asyncio.Task[None] | None = None
+        self._stop_requested = False
+        self._final_event_sent = False
+
+    @property
+    def pid(self) -> int | None:
+        return self._pid
+
+    @property
+    def is_alive(self) -> bool:
+        return not self._final_event_sent and self.state not in {"stopped", "finished", "failed"}
+
+    def discovery_ttys(self) -> set[str]:
+        if not self.pane_tty:
+            return set()
+        return {Path(self.pane_tty).name, self.pane_tty.removeprefix("/dev/")}
+
+    async def start(self) -> None:
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_path.touch(exist_ok=True)
+        self.repo_path = await self._git_value("rev-parse", "--show-toplevel")
+        self.git_branch = await self._git_value("branch", "--show-current")
+
+        shell_command = f"exec {self.command}"
+        await self._tmux("new-session", "-d", "-s", self.session_name, "-c", self.cwd, shell_command)
+        await self._tmux("set-option", "-t", self.session_name, "remain-on-exit", "on")
+        await self._refresh_tmux_state()
+        if self.pane_id is None:
+            raise TmuxSessionError("tmux did not return a pane id")
+        await self._tmux("pipe-pane", "-o", "-t", self.pane_id, f"cat >> {shlex.quote(str(self.log_path))}")
+        self._log_task = asyncio.create_task(self._log_loop())
+
+        await self.emit(
+            {
+                "type": "session_event",
+                "event_type": "started",
+                "session_id": self.session_id,
+                "name": self.name,
+                "command": self.command,
+                "cwd": self.cwd,
+                "pid": self.pid,
+                "source": "managed",
+                "repo_path": self.repo_path,
+                "git_branch": self.git_branch,
+                "meta": self._meta(),
+            }
+        )
+
+        if self.initial_prompt.strip():
+            await asyncio.sleep(0.4)
+            await self.send_input(self.initial_prompt.strip())
+            await self.send_enter()
+
+    async def stop(self) -> None:
+        if self._final_event_sent:
+            return
+        self._stop_requested = True
+        if self.pane_id is not None:
+            try:
+                await self._tmux("send-keys", "-t", self.pane_id, "C-c")
+                await asyncio.sleep(0.3)
+            except TmuxSessionError:
+                pass
+        await self._tmux("kill-session", "-t", self.session_name, check=False)
+        await self._finalize("stopped", 130)
+
+    async def send_input(self, text: str) -> None:
+        if self.pane_id is None:
+            raise TmuxSessionError("Terminal session is not initialized")
+        pieces = text.splitlines(keepends=True) or [text]
+        for piece in pieces:
+            stripped = piece.rstrip("\n")
+            if stripped:
+                await self._tmux("send-keys", "-t", self.pane_id, "-l", "--", stripped)
+            if piece.endswith("\n"):
+                await self.send_enter()
+
+    async def send_enter(self) -> None:
+        if self.pane_id is None:
+            raise TmuxSessionError("Terminal session is not initialized")
+        await self._tmux("send-keys", "-t", self.pane_id, "Enter")
+
+    async def interrupt(self) -> None:
+        if self.pane_id is None:
+            raise TmuxSessionError("Terminal session is not initialized")
+        await self._tmux("send-keys", "-t", self.pane_id, "C-c")
+
+    async def emit_heartbeat(self) -> None:
+        await self._refresh_tmux_state()
+        if self._final_event_sent:
+            return
+        await self.emit(
+            {
+                "type": "session_event",
+                "event_type": "heartbeat",
+                "session_id": self.session_id,
+                "state": self.state,
+                "name": self.name,
+                "command": self.command,
+                "cwd": self.cwd,
+                "pid": self.pid,
+                "source": "managed",
+                "repo_path": self.repo_path,
+                "git_branch": self.git_branch,
+                "meta": self._meta(),
+            }
+        )
+
+    async def sync(self) -> None:
+        await self._refresh_tmux_state()
+        if self._final_event_sent:
+            await self.emit(
+                {
+                    "type": "session_event",
+                    "event_type": "failed" if self.state == "failed" else "stopped",
+                    "session_id": self.session_id,
+                    "state": self.state,
+                    "exit_code": self.exit_code,
+                    "name": self.name,
+                    "command": self.command,
+                    "cwd": self.cwd,
+                    "pid": self.pid,
+                    "source": "managed",
+                    "repo_path": self.repo_path,
+                    "git_branch": self.git_branch,
+                    "meta": self._meta(),
+                }
+            )
+            return
+        await self.emit_heartbeat()
+
+    async def resolve_approval(self, *, approved: bool, approval_id: str) -> None:
+        raise RuntimeError("tmux terminal sessions do not support structured approvals")
+
+    async def _log_loop(self) -> None:
+        while True:
+            await self._drain_log()
+            await self._refresh_tmux_state()
+            if self._final_event_sent:
+                await self._drain_log()
+                break
+            await asyncio.sleep(0.25)
+
+    async def _drain_log(self) -> None:
+        if not self.log_path.exists():
+            return
+        with self.log_path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(self._log_offset)
+            chunk = handle.read()
+            self._log_offset = handle.tell()
+        if not chunk:
+            return
+        await self.emit(
+            {
+                "type": "session_event",
+                "event_type": "output",
+                "session_id": self.session_id,
+                "text": chunk,
+                "state": self.state,
+                "meta": self._meta(),
+            }
+        )
+
+    async def _refresh_tmux_state(self) -> None:
+        if self._final_event_sent:
+            return
+        output = await self._tmux(
+            "display-message",
+            "-p",
+            "-t",
+            self.session_name,
+            "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_dead}\t#{pane_dead_status}\t#{session_attached}",
+            check=False,
+        )
+        if output is None:
+            await self._finalize("stopped" if self._stop_requested else "failed", self.exit_code)
+            return
+
+        fields = output.strip().split("\t")
+        if len(fields) != 7:
+            raise TmuxSessionError(f"Unexpected tmux state line: {output!r}")
+        _, pane_id, pane_pid, pane_tty, pane_dead, pane_dead_status, attached = fields
+        self.pane_id = pane_id
+        self._pid = int(pane_pid) if pane_pid.isdigit() else self._pid
+        self.pane_tty = pane_tty
+        self.attached_clients = int(attached or "0")
+
+        if pane_dead == "1":
+            exit_code = int(pane_dead_status) if pane_dead_status.strip("-").isdigit() else self.exit_code
+            final_state = "stopped" if (exit_code or 0) == 0 or self._stop_requested else "failed"
+            await self._finalize(final_state, exit_code)
+            return
+
+        self.state = "running"
+
+    async def _finalize(self, state: str, exit_code: int | None) -> None:
+        if self._final_event_sent:
+            return
+        self._final_event_sent = True
+        self.state = state
+        self.exit_code = exit_code
+        await self.emit(
+            {
+                "type": "session_event",
+                "event_type": "failed" if state == "failed" else "stopped",
+                "session_id": self.session_id,
+                "state": state,
+                "exit_code": exit_code,
+                "name": self.name,
+                "command": self.command,
+                "cwd": self.cwd,
+                "pid": self.pid,
+                "source": "managed",
+                "repo_path": self.repo_path,
+                "git_branch": self.git_branch,
+                "meta": self._meta(),
+            }
+        )
+
+    async def _git_value(self, *args: str) -> str | None:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "git",
+                "-C",
+                self.cwd,
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            return None
+        stdout, _stderr = await process.communicate()
+        if process.returncode != 0:
+            return None
+        value = stdout.decode("utf-8", errors="replace").strip()
+        return value or None
+
+    async def _tmux(self, *args: str, check: bool = True) -> str | None:
+        process = await asyncio.create_subprocess_exec(
+            self.tmux_bin,
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            if check:
+                message = stderr.decode("utf-8", errors="replace").strip() or f"tmux exited with {process.returncode}"
+                raise TmuxSessionError(message)
+            return None
+        return stdout.decode("utf-8", errors="replace")
+
+    def _meta(self) -> dict[str, Any]:
+        return {
+            "transport": self.transport,
+            "initial_prompt": self.initial_prompt,
+            "tmux_session": self.session_name,
+            "tmux_pane": self.pane_id,
+            "pane_tty": self.pane_tty,
+            "attached_clients": self.attached_clients,
+            "attach_command": f"{self.tmux_bin} attach-session -t {self.session_name}",
+            "argv": self.argv,
+        }

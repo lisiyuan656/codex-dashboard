@@ -6,7 +6,8 @@ It provides:
 
 - a central FastAPI web app with login, machine overview, session detail, and live websocket updates
 - a lightweight Python agent that connects back to the server and manages local Codex sessions
-- a native Codex app-server session runner over stdio JSON-RPC so the browser can send text, stop sessions, and answer structured approvals
+- tmux-backed terminal sessions so you can keep using real remote terminals while the dashboard tracks and controls them
+- a secondary native Codex app-server session runner over stdio JSON-RPC for browser-only managed sessions
 - read-only discovery of unmanaged `codex` processes on each host
 
 ## Status
@@ -14,9 +15,10 @@ It provides:
 This repository contains an MVP implementation of the plan:
 
 - monitoring is functional
-- remote interaction is functional for managed sessions launched through the agent
+- remote interaction is functional for managed tmux terminal sessions and native app-server sessions launched through the agent
 - unmanaged sessions are detected and shown but are not controllable
-- approval handling for managed sessions uses native Codex app-server requests and JSON-RPC responses
+- terminal sessions are the default managed path; app-server sessions remain available as a secondary mode
+- approval handling is structured only for app-server sessions; tmux terminal sessions use raw terminal input
 
 ## Quick Start
 
@@ -44,6 +46,17 @@ uv run codex-dashboard-agent
 
 4. Open `http://127.0.0.1:8000`, log in as `admin`, and launch a managed session from an agent page.
 
+5. For a terminal-first workflow on the host that runs the agent, launch through the local agent socket and immediately attach to tmux:
+
+```bash
+uv run codex-dashboard-cli launch-tty \
+  --cwd /mnt/data/Projects/codex-dashboard \
+  --name "Local Terminal Session" \
+  -- resume --last
+```
+
+This creates a managed tmux-backed Codex session, registers it with the dashboard, and attaches your terminal to it.
+
 ## CLI Launch
 
 You can also launch a managed session without the browser:
@@ -56,10 +69,23 @@ uv run codex-dashboard-cli launch \
   --agent workstation-omarchy \
   --cwd /mnt/data/Projects/codex-dashboard \
   --name "CLI Managed Session" \
-  --prompt "Inspect the repository and summarize the current dashboard architecture."
+  --prompt "Inspect the repository and summarize the current dashboard architecture." \
+  -- resume --last
 ```
 
-If you omit `--prompt`, the session starts idle. If you omit `--password`, the CLI will prompt for it.
+The remote `launch` command defaults to terminal mode. Add `--mode app_server` if you want the older browser-only native app-server flow. If you omit `--prompt`, the session starts idle. If you omit `--password`, the CLI will prompt for it.
+
+## Shell Alias
+
+On a managed host, you can replace your usual `codex` launch with a shell function that still opens a real terminal session while registering it with the dashboard:
+
+```bash
+codex() {
+  uv run codex-dashboard-cli launch-tty --cwd "$PWD" -- "$@"
+}
+```
+
+This keeps your workflow terminal-first while the dashboard gains visibility over the session.
 
 ## Configuration
 
@@ -81,9 +107,13 @@ If you omit `--prompt`, the session starts idle. If you omit `--password`, the C
 - `CODEX_DASHBOARD_AGENT_LABELS`
 - `CODEX_DASHBOARD_AGENT_HEARTBEAT_SECONDS`
 - `CODEX_DASHBOARD_AGENT_WATCH_SECONDS`
+- `CODEX_DASHBOARD_AGENT_SOCKET_PATH`
+- `CODEX_DASHBOARD_AGENT_SPOOL_DIR`
+- `CODEX_DASHBOARD_TMUX_BIN`
 
 ## Notes
 
-- Managed sessions use `codex app-server` over stdio.
-- The current live UI is intentionally simple: it favors control and observability over full terminal emulation.
+- Managed sessions default to tmux-backed terminals using `codex --no-alt-screen`.
+- App-server sessions are still available, mainly for structured approvals and browser-only control.
+- The current live UI favors observability plus text/Enter/Ctrl-C over full browser terminal emulation.
 - The server defaults to SQLite for local development but accepts PostgreSQL URLs via `CODEX_DASHBOARD_DATABASE_URL`.

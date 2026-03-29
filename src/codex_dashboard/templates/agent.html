@@ -16,8 +16,15 @@
 </div>
 
 <div class="card" style="margin-top: 1rem;">
-  <h2>Launch Native App-Server Session</h2>
+  <h2>Launch Managed Session</h2>
   <form id="launch-form">
+    <label>
+      Launch mode
+      <select name="launch_mode">
+        <option value="terminal" selected>Terminal in tmux</option>
+        <option value="app_server">Native app-server</option>
+      </select>
+    </label>
     <label>
       Name
       <input name="name" value="Managed Codex Session">
@@ -27,12 +34,39 @@
       <input name="cwd" value=".">
     </label>
     <label>
+      Codex args
+      <input name="argv" placeholder="Optional: resume --last">
+    </label>
+    <label>
       Initial prompt
-      <textarea name="initial_prompt" rows="5" placeholder="Optional: start the session with a prompt. Leave empty to open an idle session."></textarea>
+      <textarea name="initial_prompt" rows="5" placeholder="Optional: send text after launch."></textarea>
     </label>
     <button type="submit">Launch</button>
     <div id="launch-error" class="error"></div>
   </form>
+</div>
+
+<div class="card" style="margin-top: 1rem;">
+  <h2>Active Sessions</h2>
+  <div class="grid">
+    {% for session in active_sessions %}
+    <div class="card">
+      <div class="toolbar">
+        <strong>{{ session.name }}</strong>
+        <span class="pill status-{{ session.state }}">{{ session.state }}</span>
+        <span class="pill">{{ session.meta.get("transport", session.source) }}</span>
+      </div>
+      <div class="meta">{{ session.command }}</div>
+      <div class="meta">{{ session.cwd }}</div>
+      {% if session.meta.get("attach_command") %}
+      <div class="meta">{{ session.meta.get("attach_command") }}</div>
+      {% endif %}
+      <a href="/sessions/{{ session.id }}">Open session</a>
+    </div>
+    {% else %}
+    <p class="meta">No active sessions.</p>
+    {% endfor %}
+  </div>
 </div>
 
 <div class="card" style="margin-top: 1rem;">
@@ -43,10 +77,13 @@
       <div class="toolbar">
         <strong>{{ session.name }}</strong>
         <span class="pill status-{{ session.state }}">{{ session.state }}</span>
-        <span class="pill">{{ session.source }}</span>
+        <span class="pill">{{ session.meta.get("transport", session.source) }}</span>
       </div>
       <div class="meta">{{ session.command }}</div>
       <div class="meta">{{ session.started_at }}</div>
+      {% if session.meta.get("attach_command") %}
+      <div class="meta">{{ session.meta.get("attach_command") }}</div>
+      {% endif %}
       <a href="/sessions/{{ session.id }}">Open session</a>
     </div>
     {% else %}
@@ -56,6 +93,11 @@
 </div>
 
 <script>
+  function parseArgv(raw) {
+    const trimmed = raw.trim();
+    return trimmed ? trimmed.split(/\s+/) : [];
+  }
+
   document.getElementById("launch-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.target);
@@ -66,6 +108,8 @@
         name: form.get("name"),
         cwd: form.get("cwd"),
         initial_prompt: form.get("initial_prompt"),
+        launch_mode: form.get("launch_mode"),
+        argv: parseArgv(form.get("argv") || ""),
       }),
     });
     const payload = await response.json();

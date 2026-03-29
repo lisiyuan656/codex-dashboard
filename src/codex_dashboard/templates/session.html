@@ -1,17 +1,33 @@
 {% extends "base.html" %}
 {% set session = detail.session %}
+{% set transport = session.meta.get("transport", "app_server" if session.source == "managed" else "unmanaged") %}
 {% block content %}
 <div class="card">
   <div class="toolbar">
     <h1 style="margin: 0;">{{ session.name }}</h1>
     <span class="pill status-{{ session.state }}">{{ session.state }}</span>
-    <span class="pill">{{ session.source }}</span>
+    <span class="pill">{{ transport }}</span>
   </div>
   <p class="meta">{{ session.command }}</p>
   <p class="meta">CWD: {{ session.cwd }}</p>
   <p class="meta">Agent: <a href="/agents/{{ session.agent_id }}">{{ session.agent_id }}</a></p>
   <p class="meta">PID: {{ session.pid or "n/a" }}</p>
   <p class="meta">Exit: {{ session.exit_code if session.exit_code is not none else "running" }}</p>
+  {% if session.repo_path %}
+  <p class="meta">Repo: {{ session.repo_path }}</p>
+  {% endif %}
+  {% if session.git_branch %}
+  <p class="meta">Branch: {{ session.git_branch }}</p>
+  {% endif %}
+  {% if session.meta.get("attach_command") %}
+  <p class="meta">Attach: {{ session.meta.get("attach_command") }}</p>
+  {% endif %}
+  {% if transport == "tmux_terminal" %}
+  <p class="meta">Attached tmux clients: {{ session.meta.get("attached_clients", 0) }}</p>
+  {% if session.meta.get("attached_clients", 0) > 0 %}
+  <p class="error">This terminal is currently attached elsewhere. Dashboard input is still allowed, so expect shared control.</p>
+  {% endif %}
+  {% endif %}
   {% if session.meta.get("initial_prompt") %}
   <pre class="session-output" style="min-height: 120px;">{{ session.meta.get("initial_prompt") }}</pre>
   {% endif %}
@@ -20,9 +36,15 @@
 <div class="card" style="margin-top: 1rem;">
   <div class="toolbar">
     <button type="button" id="lock-button">{{ "Acquire Lock" if not detail.lock or detail.lock.user_id != user.id else "Release Lock" }}</button>
-    {% if session.source == "managed" %}
+    {% if session.source == "managed" and transport == "app_server" %}
     <button type="button" id="approve-button" class="secondary">Approve</button>
     <button type="button" id="deny-button" class="secondary">Deny</button>
+    {% endif %}
+    {% if session.source == "managed" and transport == "tmux_terminal" %}
+    <button type="button" id="enter-button" class="secondary">Enter</button>
+    <button type="button" id="interrupt-button" class="secondary">Ctrl-C</button>
+    {% endif %}
+    {% if session.source == "managed" %}
     <button type="button" id="stop-button" class="danger">Stop</button>
     {% endif %}
     <span class="pill" id="lock-state">
@@ -35,13 +57,14 @@
   </div>
 
   <div class="toolbar">
-    <input id="input-box" placeholder="Send text to the native app-server session" {% if session.source != "managed" %}disabled{% endif %}>
+    <input id="input-box" placeholder="{{ 'Send text to the tmux session' if transport == 'tmux_terminal' else 'Send text to the native app-server session' }}" {% if session.source != "managed" %}disabled{% endif %}>
     <button type="button" id="send-button" {% if session.source != "managed" %}disabled{% endif %}>Send</button>
   </div>
 
   <pre id="session-output" class="session-output">{{ session.last_output_excerpt or "" }}</pre>
 </div>
 
+{% if transport == "app_server" %}
 <div class="card" style="margin-top: 1rem;">
   <h2>Approvals</h2>
   <div class="grid">
@@ -58,6 +81,7 @@
     {% endfor %}
   </div>
 </div>
+{% endif %}
 
 <div class="card" style="margin-top: 1rem;">
   <h2>Timeline</h2>
@@ -128,9 +152,27 @@
     try {
       const input = inputBox.value;
       if (!input) return;
-      await postJson(`/api/sessions/${sessionId}/actions`, { type: "send_input", input: `${input}\n` });
+      await postJson(`/api/sessions/${sessionId}/actions`, { type: "send_input", input });
       prependEvent("input", { input });
       inputBox.value = "";
+    } catch (error) {
+      alert(error.message);
+    }
+  });
+
+  document.getElementById("enter-button")?.addEventListener("click", async () => {
+    try {
+      await postJson(`/api/sessions/${sessionId}/actions`, { type: "send_enter" });
+      prependEvent("enter", {});
+    } catch (error) {
+      alert(error.message);
+    }
+  });
+
+  document.getElementById("interrupt-button")?.addEventListener("click", async () => {
+    try {
+      await postJson(`/api/sessions/${sessionId}/actions`, { type: "interrupt_session" });
+      prependEvent("interrupt", {});
     } catch (error) {
       alert(error.message);
     }
@@ -155,6 +197,7 @@
   document.getElementById("stop-button")?.addEventListener("click", async () => {
     try {
       await postJson(`/api/sessions/${sessionId}/actions`, { type: "stop_session" });
+      prependEvent("stop", {});
     } catch (error) {
       alert(error.message);
     }
