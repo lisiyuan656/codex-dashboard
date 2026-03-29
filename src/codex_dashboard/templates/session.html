@@ -12,6 +12,9 @@
   <p class="meta">Agent: <a href="/agents/{{ session.agent_id }}">{{ session.agent_id }}</a></p>
   <p class="meta">PID: {{ session.pid or "n/a" }}</p>
   <p class="meta">Exit: {{ session.exit_code if session.exit_code is not none else "running" }}</p>
+  {% if session.meta.get("initial_prompt") %}
+  <pre class="session-output" style="min-height: 120px;">{{ session.meta.get("initial_prompt") }}</pre>
+  {% endif %}
 </div>
 
 <div class="card" style="margin-top: 1rem;">
@@ -32,7 +35,7 @@
   </div>
 
   <div class="toolbar">
-    <input id="input-box" placeholder="Send text or commands to the managed session" {% if session.source != "managed" %}disabled{% endif %}>
+    <input id="input-box" placeholder="Send text to the native app-server session" {% if session.source != "managed" %}disabled{% endif %}>
     <button type="button" id="send-button" {% if session.source != "managed" %}disabled{% endif %}>Send</button>
   </div>
 

@@ -6,7 +6,7 @@ It provides:
 
 - a central FastAPI web app with login, machine overview, session detail, and live websocket updates
 - a lightweight Python agent that connects back to the server and manages local Codex sessions
-- a PTY-backed managed session runner so the browser can send text, stop sessions, and answer simple approvals
+- a native Codex app-server session runner over stdio JSON-RPC so the browser can send text, stop sessions, and answer structured approvals
 - read-only discovery of unmanaged `codex` processes on each host
 
 ## Status
@@ -16,7 +16,7 @@ This repository contains an MVP implementation of the plan:
 - monitoring is functional
 - remote interaction is functional for managed sessions launched through the agent
 - unmanaged sessions are detected and shown but are not controllable
-- approval handling is heuristic and PTY-based rather than a native Codex app-server integration
+- approval handling for managed sessions uses native Codex app-server requests and JSON-RPC responses
 
 ## Quick Start
 
@@ -67,6 +67,6 @@ uv run codex-dashboard-agent
 
 ## Notes
 
-- Managed sessions run under a PTY and work best with `codex --no-alt-screen`.
+- Managed sessions use `codex app-server` over stdio.
 - The current live UI is intentionally simple: it favors control and observability over full terminal emulation.
 - The server defaults to SQLite for local development but accepts PostgreSQL URLs via `CODEX_DASHBOARD_DATABASE_URL`.

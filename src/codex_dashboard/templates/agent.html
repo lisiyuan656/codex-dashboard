@@ -16,7 +16,7 @@
 </div>
 
 <div class="card" style="margin-top: 1rem;">
-  <h2>Launch Managed Session</h2>
+  <h2>Launch Native App-Server Session</h2>
   <form id="launch-form">
     <label>
       Name
@@ -27,8 +27,8 @@
       <input name="cwd" value=".">
     </label>
     <label>
-      Command
-      <input name="command" value="codex --no-alt-screen">
+      Initial prompt
+      <textarea name="initial_prompt" rows="5" placeholder="Optional: start the session with a prompt. Leave empty to open an idle session."></textarea>
     </label>
     <button type="submit">Launch</button>
     <div id="launch-error" class="error"></div>
@@ -65,7 +65,7 @@
       body: JSON.stringify({
         name: form.get("name"),
         cwd: form.get("cwd"),
-        command: form.get("command"),
+        initial_prompt: form.get("initial_prompt"),
       }),
     });
     const payload = await response.json();

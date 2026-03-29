@@ -146,19 +146,19 @@ def create_app() -> FastAPI:
         if get_agent_detail(db, agent_id) is None:
             raise HTTPException(status_code=404, detail="Agent not found")
         payload = await request.json()
-        command = payload.get("command", "").strip()
+        initial_prompt = payload.get("initial_prompt", "").strip()
+        if not initial_prompt:
+            initial_prompt = payload.get("command", "").strip()
         cwd = payload.get("cwd", "").strip() or "."
-        if not command:
-            raise HTTPException(status_code=400, detail="command is required")
         session = create_pending_session(
             db,
             agent_id=agent_id,
             user_id=user.id,
             source="managed",
             name=payload.get("name", "Managed Codex Session").strip() or "Managed Codex Session",
-            command=command,
+            command="codex app-server",
             cwd=cwd,
-            meta={},
+            meta={"initial_prompt": initial_prompt},
         )
         try:
             await hub.send_action(
@@ -166,9 +166,9 @@ def create_app() -> FastAPI:
                 {
                     "type": "launch_session",
                     "session_id": session.id,
-                    "command": command,
                     "cwd": cwd,
                     "name": session.name,
+                    "prompt": initial_prompt,
                 },
             )
         except RuntimeError as exc:

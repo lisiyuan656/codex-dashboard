@@ -14,6 +14,7 @@ class AgentConfig:
     labels: list[str]
     heartbeat_seconds: int
     watch_seconds: int
+    codex_bin: str
 
 
 def load_config() -> AgentConfig:
@@ -29,4 +30,5 @@ def load_config() -> AgentConfig:
         labels=labels,
         heartbeat_seconds=int(os.getenv("CODEX_DASHBOARD_AGENT_HEARTBEAT_SECONDS", "15")),
         watch_seconds=int(os.getenv("CODEX_DASHBOARD_AGENT_WATCH_SECONDS", "15")),
+        codex_bin=os.getenv("CODEX_DASHBOARD_CODEX_BIN", "codex"),
     )

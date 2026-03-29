@@ -12,14 +12,14 @@ from typing import Any
 import websockets
 
 from .config import AgentConfig
-from .session import ManagedPtySession
+from .session import AppServerSession
 
 
 class DashboardAgent:
     def __init__(self, config: AgentConfig) -> None:
         self.config = config
         self.hostname = socket.gethostname()
-        self.sessions: dict[str, ManagedPtySession] = {}
+        self.sessions: dict[str, AppServerSession] = {}
         self.ws: websockets.ClientConnection | None = None
 
     async def emit(self, payload: dict[str, Any]) -> None:
@@ -73,7 +73,18 @@ class DashboardAgent:
             for session_id, session in list(self.sessions.items()):
                 if session.process is None or session.process.returncode is not None:
                     continue
-                await self.emit({"type": "session_event", "event_type": "heartbeat", "session_id": session_id, "state": "running"})
+                await self.emit(
+                    {
+                        "type": "session_event",
+                        "event_type": "heartbeat",
+                        "session_id": session_id,
+                        "state": session.state,
+                        "meta": {
+                            "thread_id": session.thread_id,
+                            "turn_id": session.active_turn_id,
+                        },
+                    }
+                )
             await asyncio.sleep(self.config.heartbeat_seconds)
 
     async def _watch_loop(self) -> None:
@@ -86,11 +97,12 @@ class DashboardAgent:
         action_type = payload.get("type")
         session_id = payload.get("session_id")
         if action_type == "launch_session":
-            session = ManagedPtySession(
+            session = AppServerSession(
                 session_id=session_id,
                 name=payload.get("name", "Managed Codex Session"),
-                command=payload["command"],
                 cwd=payload["cwd"],
+                initial_prompt=payload.get("prompt", ""),
+                codex_bin=self.config.codex_bin,
                 emit=self.emit,
             )
             self.sessions[session_id] = session
@@ -122,7 +134,7 @@ class DashboardAgent:
         return {
             "platform": platform.platform(),
             "python": platform.python_version(),
-            "codex_path": shutil.which("codex"),
+            "codex_path": shutil.which(self.config.codex_bin) or self.config.codex_bin,
         }
 
     def _discover_unmanaged_codex(self) -> Iterable[dict[str, Any]]:

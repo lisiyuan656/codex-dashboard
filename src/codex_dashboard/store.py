@@ -194,6 +194,8 @@ def ingest_session_event(db: Session, agent_id: str, payload: dict[str, Any]) ->
     session.git_branch = payload.get("git_branch", session.git_branch)
     session.pid = payload.get("pid", session.pid)
     session.last_heartbeat_at = utcnow()
+    if payload.get("meta"):
+        session.meta = {**(session.meta or {}), **payload["meta"]}
 
     if event_type == "started":
         session.state = "running"
@@ -201,7 +203,7 @@ def ingest_session_event(db: Session, agent_id: str, payload: dict[str, Any]) ->
     elif event_type == "output":
         session.state = payload.get("state", session.state or "running")
         chunk = payload.get("text", "")
-        session.last_output_excerpt = chunk[-4000:]
+        session.last_output_excerpt = ((session.last_output_excerpt or "") + chunk)[-4000:]
     elif event_type == "heartbeat":
         if session.state not in {"awaiting_approval", "stopped", "finished", "failed"}:
             session.state = payload.get("state", "running")
