@@ -1,7 +1,7 @@
 import json
 from typing import Any
 
-from codex_dashboard.cli import launch_local_terminal_session, launch_managed_session
+from codex_dashboard.cli import complete_local_terminal_session, launch_local_terminal_session, launch_managed_session
 
 
 class FakeResponse:
@@ -69,6 +69,9 @@ def test_launch_local_terminal_session_uses_unix_socket(monkeypatch) -> None:
     received: dict[str, Any] = {}
 
     class FakeSocket:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self.payload = payload
+
         def connect(self, path: str) -> None:
             received["path"] = path
 
@@ -79,30 +82,31 @@ def test_launch_local_terminal_session_uses_unix_socket(monkeypatch) -> None:
             if received.get("closed"):
                 return b""
             received["closed"] = True
-            return (
-                json.dumps(
-                    {
-                        "ok": True,
-                        "session_id": "local-session",
-                        "meta": {
-                            "tmux_session": "codexdash-local",
-                            "attach_command": "tmux attach-session -t codexdash-local",
-                        },
-                    }
-                ).encode("utf-8")
-                + b"\n"
-            )
+            return json.dumps(self.payload).encode("utf-8") + b"\n"
 
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr("socket.socket", lambda *args, **kwargs: FakeSocket())
+    monkeypatch.setattr(
+        "socket.socket",
+        lambda *args, **kwargs: FakeSocket(
+            {
+                "ok": True,
+                "session_id": "local-session",
+                "meta": {
+                    "tmux_session": "codexdash-local",
+                    "attach_command": "tmux attach-session -t codexdash-local",
+                },
+            }
+        ),
+    )
     result = launch_local_terminal_session(
         socket_path="/tmp/agent.sock",
         cwd="/repo",
         name="TTY Session",
         initial_prompt="",
         argv=["resume", "--last"],
+        tmux_pane="%7",
     )
 
     assert result["session_id"] == "local-session"
@@ -114,6 +118,45 @@ def test_launch_local_terminal_session_uses_unix_socket(monkeypatch) -> None:
             "name": "TTY Session",
             "initial_prompt": "",
             "argv": ["resume", "--last"],
+            "tmux_pane": "%7",
+        },
+        "closed": True,
+    }
+
+
+def test_complete_local_terminal_session_reports_exit_code(monkeypatch) -> None:
+    received: dict[str, Any] = {}
+
+    class FakeSocket:
+        def connect(self, path: str) -> None:
+            received["path"] = path
+
+        def sendall(self, data: bytes) -> None:
+            received["payload"] = json.loads(data.decode("utf-8").strip())
+
+        def recv(self, _size: int) -> bytes:
+            if received.get("closed"):
+                return b""
+            received["closed"] = True
+            return json.dumps({"ok": True}).encode("utf-8") + b"\n"
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("socket.socket", lambda *args, **kwargs: FakeSocket())
+    result = complete_local_terminal_session(
+        socket_path="/tmp/agent.sock",
+        session_id="session-123",
+        exit_code=130,
+    )
+
+    assert result["ok"] is True
+    assert received == {
+        "path": "/tmp/agent.sock",
+        "payload": {
+            "type": "complete_terminal",
+            "session_id": "session-123",
+            "exit_code": 130,
         },
         "closed": True,
     }

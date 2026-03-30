@@ -46,7 +46,7 @@ uv run codex-dashboard-agent
 
 4. Open `http://127.0.0.1:8000`, log in as `admin`, and launch a managed session from an agent page.
 
-5. For a terminal-first workflow on the host that runs the agent, launch through the local agent socket and immediately attach to tmux:
+5. For a terminal-first workflow on the host that runs the agent, run the wrapper inside your existing tmux pane:
 
 ```bash
 uv run codex-dashboard-cli launch-tty \
@@ -55,7 +55,7 @@ uv run codex-dashboard-cli launch-tty \
   -- resume --last
 ```
 
-This creates a managed tmux-backed Codex session, registers it with the dashboard, and attaches your terminal to it.
+If `TMUX_PANE` is set, the wrapper reuses that current pane and runs Codex in the foreground there. If you are not already inside tmux, it falls back to creating a detached tmux session and can attach you to it.
 
 ## CLI Launch
 
@@ -85,7 +85,7 @@ codex() {
 }
 ```
 
-This keeps your workflow terminal-first while the dashboard gains visibility over the session.
+This keeps your workflow terminal-first while the dashboard gains visibility over the session. When run inside tmux, the wrapper now reuses the current pane instead of forcing a second tmux session.
 
 ## Configuration
 

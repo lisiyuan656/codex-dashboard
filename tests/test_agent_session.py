@@ -226,6 +226,60 @@ def test_app_server_session_resolves_approval(tmp_path: Path) -> None:
     asyncio.run(run_case())
 
 
+def test_tmux_terminal_session_can_adopt_existing_pane(tmp_path: Path) -> None:
+    async def run_case() -> None:
+        events: list[dict] = []
+
+        async def emit(payload: dict) -> None:
+            events.append(payload)
+
+        session = TmuxTerminalSession(
+            session_id="pane-session",
+            name="Pane Test",
+            cwd=str(tmp_path),
+            codex_bin="codex",
+            tmux_bin="tmux",
+            emit=emit,
+            spool_dir=str(tmp_path),
+            argv=["resume", "--last"],
+            initial_prompt="",
+            existing_pane_id="%7",
+        )
+
+        async def fake_git_value(*args: str) -> str | None:
+            if args == ("rev-parse", "--show-toplevel"):
+                return str(tmp_path)
+            if args == ("branch", "--show-current"):
+                return "main"
+            return None
+
+        async def fake_tmux(*args: str, check: bool = True) -> str | None:
+            del check
+            if args[0] == "display-message":
+                return "work\t%7\t4321\t/dev/pts/7\t0\t\t1\tcodex\n"
+            if args[0] == "pipe-pane":
+                return ""
+            if args[0] == "send-keys":
+                return ""
+            return ""
+
+        session._git_value = fake_git_value  # type: ignore[method-assign]
+        session._tmux = fake_tmux  # type: ignore[method-assign]
+
+        await session.start()
+        await session.report_completion(0)
+
+        started = next(event for event in events if event.get("event_type") == "started")
+        stopped = next(event for event in events if event.get("event_type") == "stopped")
+        assert started["meta"]["tmux_launch_mode"] == "current_pane"
+        assert started["meta"]["tmux_pane"] == "%7"
+        assert started["meta"]["attach_command"] == "tmux attach-session -t work"
+        assert stopped["exit_code"] == 0
+        assert stopped["state"] == "stopped"
+
+    asyncio.run(run_case())
+
+
 @pytest.mark.skipif(not tmux_is_usable(), reason="tmux is not usable in this test environment")
 def test_tmux_terminal_session_emits_output_and_stops(tmp_path: Path) -> None:
     async def run_case() -> None:

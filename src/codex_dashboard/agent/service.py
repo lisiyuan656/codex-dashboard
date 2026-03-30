@@ -157,6 +157,7 @@ class DashboardAgent:
         launch_mode = payload.get("launch_mode", "terminal")
         initial_prompt = payload.get("prompt", "")
         argv = [str(item) for item in payload.get("argv", [])]
+        tmux_pane = payload.get("tmux_pane")
 
         if launch_mode == "app_server":
             session: SessionRuntime = AppServerSession(
@@ -178,6 +179,7 @@ class DashboardAgent:
                 spool_dir=self.config.spool_dir,
                 argv=argv,
                 initial_prompt=initial_prompt,
+                existing_pane_id=tmux_pane,
             )
 
         self.sessions[session_id] = session
@@ -198,6 +200,7 @@ class DashboardAgent:
                     "source": "managed",
                     "meta": {
                         "transport": launch_mode if launch_mode == "app_server" else "tmux_terminal",
+                        "tmux_launch_mode": "detached_session" if not tmux_pane else "current_pane",
                     },
                     "text": f"[agent launch error] {exc}",
                 }
@@ -247,6 +250,7 @@ class DashboardAgent:
                     "cwd": payload.get("cwd", "."),
                     "prompt": payload.get("initial_prompt", ""),
                     "argv": payload.get("argv", []),
+                    "tmux_pane": payload.get("tmux_pane"),
                 }
             )
             session = self.sessions[session_id]
@@ -263,6 +267,10 @@ class DashboardAgent:
                 "command": session.command,
                 "meta": meta,
             }
+        if request_type == "complete_terminal":
+            session = self._require_session(payload["session_id"], transport="tmux_terminal")
+            await session.report_completion(payload.get("exit_code"))
+            return {"ok": True}
         if request_type == "send_terminal_input":
             session = self._require_session(payload["session_id"], transport="tmux_terminal")
             await session.send_input(payload["input"])

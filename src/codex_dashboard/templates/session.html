@@ -22,6 +22,9 @@
   {% if session.meta.get("attach_command") %}
   <p class="meta">Attach: {{ session.meta.get("attach_command") }}</p>
   {% endif %}
+  {% if session.meta.get("tmux_launch_mode") %}
+  <p class="meta">Tmux mode: {{ session.meta.get("tmux_launch_mode") }}</p>
+  {% endif %}
   {% if transport == "tmux_terminal" %}
   <p class="meta">Attached tmux clients: {{ session.meta.get("attached_clients", 0) }}</p>
   {% if session.meta.get("attached_clients", 0) > 0 %}

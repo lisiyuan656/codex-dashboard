@@ -5,7 +5,9 @@ import getpass
 import json
 import os
 from pathlib import Path
+import signal
 import socket
+import subprocess
 import sys
 from typing import Any
 import urllib.error
@@ -25,6 +27,10 @@ def _trimmed_base_url(value: str) -> str:
 def _default_socket_path() -> str:
     runtime_dir = Path(os.getenv("XDG_RUNTIME_DIR", "/tmp"))
     return os.getenv("CODEX_DASHBOARD_AGENT_SOCKET_PATH", str(runtime_dir / "codex-dashboard-agent.sock"))
+
+
+def _codex_bin() -> str:
+    return os.getenv("CODEX_DASHBOARD_CODEX_BIN", "codex")
 
 
 def _normalize_codex_args(items: list[str]) -> list[str]:
@@ -137,6 +143,7 @@ def launch_local_terminal_session(
     name: str,
     initial_prompt: str,
     argv: list[str] | None = None,
+    tmux_pane: str | None = None,
 ) -> dict[str, Any]:
     return _post_local_socket(
         socket_path,
@@ -146,8 +153,49 @@ def launch_local_terminal_session(
             "name": name,
             "initial_prompt": initial_prompt,
             "argv": list(argv or []),
+            "tmux_pane": tmux_pane,
         },
     )
+
+
+def complete_local_terminal_session(*, socket_path: str, session_id: str, exit_code: int | None) -> dict[str, Any]:
+    return _post_local_socket(
+        socket_path,
+        {
+            "type": "complete_terminal",
+            "session_id": session_id,
+            "exit_code": exit_code,
+        },
+    )
+
+
+def _run_foreground_codex(*, cwd: str, argv: list[str]) -> int:
+    command = [_codex_bin(), "--no-alt-screen", *argv]
+    try:
+        process = subprocess.Popen(command, cwd=cwd)
+    except FileNotFoundError:
+        print(f"error: failed to launch {_codex_bin()}", file=sys.stderr)
+        return 127
+
+    handled_signals = [signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT]
+    old_handlers = {sig: signal.getsignal(sig) for sig in handled_signals}
+
+    def forward_signal(signum: int, _frame: Any) -> None:
+        if process.poll() is None:
+            process.send_signal(signum)
+
+    for sig in handled_signals:
+        signal.signal(sig, forward_signal)
+
+    try:
+        while True:
+            try:
+                return process.wait()
+            except KeyboardInterrupt:
+                continue
+    finally:
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -172,7 +220,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     launch_tty = subparsers.add_parser(
         "launch-tty",
-        help="Launch a local tmux-backed managed session through the local machine agent.",
+        help="Launch a local terminal-managed session through the local agent, reusing the current tmux pane when possible.",
     )
     launch_tty.add_argument("--socket", default=_default_socket_path(), dest="socket_path")
     launch_tty.add_argument("--cwd", default=os.getcwd())
@@ -215,13 +263,16 @@ def main() -> None:
         return
 
     if args.command == "launch-tty":
+        codex_args = _normalize_codex_args(args.codex_args)
+        tmux_pane = os.getenv("TMUX_PANE", "").strip() or None
         try:
             result = launch_local_terminal_session(
                 socket_path=args.socket_path,
                 cwd=args.cwd,
                 name=args.name,
                 initial_prompt=args.initial_prompt,
-                argv=_normalize_codex_args(args.codex_args),
+                argv=codex_args,
+                tmux_pane=tmux_pane,
             )
         except DashboardCliError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -230,13 +281,25 @@ def main() -> None:
         meta = result.get("meta", {})
         tmux_session = meta.get("tmux_session")
         attach_command = meta.get("attach_command")
+        session_id = result.get("session_id")
+        if tmux_pane and session_id:
+            exit_code = _run_foreground_codex(cwd=args.cwd, argv=codex_args)
+            try:
+                complete_local_terminal_session(
+                    socket_path=args.socket_path,
+                    session_id=session_id,
+                    exit_code=exit_code,
+                )
+            except DashboardCliError as exc:
+                print(f"warning: failed to report session completion: {exc}", file=sys.stderr)
+            raise SystemExit(exit_code)
         if not args.detach and sys.stdin.isatty() and sys.stdout.isatty() and tmux_session:
             os.execvp("tmux", ["tmux", "attach-session", "-t", tmux_session])
         print(
             json.dumps(
                 {
                     "ok": True,
-                    "session_id": result.get("session_id"),
+                    "session_id": session_id,
                     "attach_command": attach_command,
                     "tmux_session": tmux_session,
                 },

@@ -41,6 +41,8 @@ class SessionRuntime(Protocol):
 
     async def sync(self) -> None: ...
 
+    async def report_completion(self, exit_code: int | None) -> None: ...
+
     def discovery_pids(self) -> set[int]: ...
 
     def discovery_ttys(self) -> set[str]: ...
@@ -77,6 +79,10 @@ class ManagedSessionBase:
         return None
 
     async def sync(self) -> None:
+        return None
+
+    async def report_completion(self, exit_code: int | None) -> None:
+        del exit_code
         return None
 
     def discovery_pids(self) -> set[int]:
@@ -665,6 +671,7 @@ class TmuxTerminalSession(ManagedSessionBase):
         spool_dir: str,
         argv: list[str] | None = None,
         initial_prompt: str = "",
+        existing_pane_id: str | None = None,
     ) -> None:
         super().__init__(session_id=session_id, name=name, cwd=cwd, emit=emit)
         self.codex_bin = codex_bin
@@ -672,11 +679,12 @@ class TmuxTerminalSession(ManagedSessionBase):
         self.argv = list(argv or [])
         self.initial_prompt = initial_prompt
         self.command = shlex.join([self.codex_bin, "--no-alt-screen", *self.argv])
-        self.session_name = f"codexdash-{self.session_id[:12]}"
+        self._requested_session_name = f"codexdash-{self.session_id[:12]}"
+        self.session_name: str | None = None
         self.log_path = Path(spool_dir) / f"{self.session_id}.log"
         self.repo_path: str | None = None
         self.git_branch: str | None = None
-        self.pane_id: str | None = None
+        self.pane_id: str | None = existing_pane_id
         self.pane_tty: str | None = None
         self._pid: int | None = None
         self.attached_clients = 0
@@ -685,6 +693,12 @@ class TmuxTerminalSession(ManagedSessionBase):
         self._log_task: asyncio.Task[None] | None = None
         self._stop_requested = False
         self._final_event_sent = False
+        self._completion_reported = False
+        self._observed_foreground_codex = False
+        self._pane_current_command: str | None = None
+        self._pipe_started = False
+        self._owns_session = existing_pane_id is None
+        self._expected_commands = {Path(self.codex_bin).name, "codex"}
 
     @property
     def pid(self) -> int | None:
@@ -701,17 +715,19 @@ class TmuxTerminalSession(ManagedSessionBase):
 
     async def start(self) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self.log_path.touch(exist_ok=True)
+        self.log_path.write_text("", encoding="utf-8")
         self.repo_path = await self._git_value("rev-parse", "--show-toplevel")
         self.git_branch = await self._git_value("branch", "--show-current")
 
-        shell_command = f"exec {self.command}"
-        await self._tmux("new-session", "-d", "-s", self.session_name, "-c", self.cwd, shell_command)
-        await self._tmux("set-option", "-t", self.session_name, "remain-on-exit", "on")
+        if self._owns_session:
+            shell_command = f"exec {self.command}"
+            await self._tmux("new-session", "-d", "-s", self._requested_session_name, "-c", self.cwd, shell_command)
+            await self._tmux("set-option", "-t", self._requested_session_name, "remain-on-exit", "on")
         await self._refresh_tmux_state()
         if self.pane_id is None:
             raise TmuxSessionError("tmux did not return a pane id")
-        await self._tmux("pipe-pane", "-o", "-t", self.pane_id, f"cat >> {shlex.quote(str(self.log_path))}")
+        await self._tmux("pipe-pane", "-t", self.pane_id, f"cat >> {shlex.quote(str(self.log_path))}")
+        self._pipe_started = True
         self._log_task = asyncio.create_task(self._log_loop())
 
         await self.emit(
@@ -730,7 +746,7 @@ class TmuxTerminalSession(ManagedSessionBase):
             }
         )
 
-        if self.initial_prompt.strip():
+        if self._owns_session and self.initial_prompt.strip():
             await asyncio.sleep(0.4)
             await self.send_input(self.initial_prompt.strip())
             await self.send_enter()
@@ -745,8 +761,13 @@ class TmuxTerminalSession(ManagedSessionBase):
                 await asyncio.sleep(0.3)
             except TmuxSessionError:
                 pass
-        await self._tmux("kill-session", "-t", self.session_name, check=False)
-        await self._finalize("stopped", 130)
+        if self._owns_session:
+            await self._tmux("kill-session", "-t", self.session_name or self._requested_session_name, check=False)
+            await self._finalize("stopped", 130)
+            return
+        await self._refresh_tmux_state()
+        if not self._observed_foreground_codex or (self._pane_current_command not in self._expected_commands):
+            await self._finalize("stopped", 130)
 
     async def send_input(self, text: str) -> None:
         if self.pane_id is None:
@@ -813,6 +834,15 @@ class TmuxTerminalSession(ManagedSessionBase):
             return
         await self.emit_heartbeat()
 
+    async def report_completion(self, exit_code: int | None) -> None:
+        if self._final_event_sent:
+            return
+        self.exit_code = exit_code
+        self._completion_reported = True
+        await self._drain_log()
+        state = "failed" if exit_code not in {None, 0, 130} else "stopped"
+        await self._finalize(state, exit_code)
+
     async def resolve_approval(self, *, approved: bool, approval_id: str) -> None:
         raise RuntimeError("tmux terminal sessions do not support structured approvals")
 
@@ -848,12 +878,13 @@ class TmuxTerminalSession(ManagedSessionBase):
     async def _refresh_tmux_state(self) -> None:
         if self._final_event_sent:
             return
+        target = self.pane_id if not self._owns_session and self.pane_id else (self.session_name or self._requested_session_name)
         output = await self._tmux(
             "display-message",
             "-p",
             "-t",
-            self.session_name,
-            "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_dead}\t#{pane_dead_status}\t#{session_attached}",
+            target,
+            "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_dead}\t#{pane_dead_status}\t#{session_attached}\t#{pane_current_command}",
             check=False,
         )
         if output is None:
@@ -861,13 +892,15 @@ class TmuxTerminalSession(ManagedSessionBase):
             return
 
         fields = output.strip().split("\t")
-        if len(fields) != 7:
+        if len(fields) != 8:
             raise TmuxSessionError(f"Unexpected tmux state line: {output!r}")
-        _, pane_id, pane_pid, pane_tty, pane_dead, pane_dead_status, attached = fields
+        session_name, pane_id, pane_pid, pane_tty, pane_dead, pane_dead_status, attached, pane_current_command = fields
+        self.session_name = session_name
         self.pane_id = pane_id
         self._pid = int(pane_pid) if pane_pid.isdigit() else self._pid
         self.pane_tty = pane_tty
         self.attached_clients = int(attached or "0")
+        self._pane_current_command = pane_current_command
 
         if pane_dead == "1":
             exit_code = int(pane_dead_status) if pane_dead_status.strip("-").isdigit() else self.exit_code
@@ -875,7 +908,25 @@ class TmuxTerminalSession(ManagedSessionBase):
             await self._finalize(final_state, exit_code)
             return
 
-        self.state = "running"
+        if self._owns_session:
+            self.state = "running"
+            return
+
+        if pane_current_command in self._expected_commands:
+            self._observed_foreground_codex = True
+            self.state = "running"
+            return
+
+        if self._completion_reported:
+            state = "failed" if self.exit_code not in {None, 0, 130} else "stopped"
+            await self._finalize(state, self.exit_code)
+            return
+
+        if self._observed_foreground_codex or self._stop_requested:
+            await self._finalize("stopped", self.exit_code)
+            return
+
+        self.state = "launching"
 
     async def _finalize(self, state: str, exit_code: int | None) -> None:
         if self._final_event_sent:
@@ -883,6 +934,7 @@ class TmuxTerminalSession(ManagedSessionBase):
         self._final_event_sent = True
         self.state = state
         self.exit_code = exit_code
+        await self._stop_pipe()
         await self.emit(
             {
                 "type": "session_event",
@@ -934,14 +986,22 @@ class TmuxTerminalSession(ManagedSessionBase):
             return None
         return stdout.decode("utf-8", errors="replace")
 
+    async def _stop_pipe(self) -> None:
+        if not self._pipe_started or self.pane_id is None:
+            return
+        await self._tmux("pipe-pane", "-t", self.pane_id, check=False)
+        self._pipe_started = False
+
     def _meta(self) -> dict[str, Any]:
         return {
             "transport": self.transport,
             "initial_prompt": self.initial_prompt,
-            "tmux_session": self.session_name,
+            "tmux_session": self.session_name or self._requested_session_name,
             "tmux_pane": self.pane_id,
             "pane_tty": self.pane_tty,
             "attached_clients": self.attached_clients,
-            "attach_command": f"{self.tmux_bin} attach-session -t {self.session_name}",
+            "attach_command": f"{self.tmux_bin} attach-session -t {self.session_name or self._requested_session_name}",
+            "tmux_launch_mode": "detached_session" if self._owns_session else "current_pane",
+            "pane_current_command": self._pane_current_command,
             "argv": self.argv,
         }
