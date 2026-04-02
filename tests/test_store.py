@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session as OrmSession
 from codex_dashboard.config import Settings
 from codex_dashboard.models import Agent, Base, Session as ManagedSession, SessionLock, User, utcnow
 from codex_dashboard.security import hash_password
-from codex_dashboard.store import acquire_lock, refresh_staleness, release_lock
+from codex_dashboard.store import acquire_lock, get_agent_sessions, list_agents_with_sessions, refresh_staleness, release_lock
 
 
 def make_db() -> OrmSession:
@@ -88,7 +88,7 @@ def test_refresh_staleness_handles_sqlite_naive_datetimes() -> None:
     assert session.state == "running"
 
 
-def test_refresh_staleness_stops_stale_unmanaged_sessions() -> None:
+def test_refresh_staleness_stops_stale_detected_unmanaged_sessions() -> None:
     db = make_db()
     now = utcnow()
     agent = Agent(
@@ -105,7 +105,7 @@ def test_refresh_staleness_stops_stale_unmanaged_sessions() -> None:
         agent_id="agent-2",
         source="unmanaged",
         name="Unmanaged",
-        state="running",
+        state="detected",
         command="codex",
         cwd=".",
         last_heartbeat_at=(now - timedelta(seconds=120)).replace(tzinfo=None),
@@ -131,3 +131,87 @@ def test_refresh_staleness_stops_stale_unmanaged_sessions() -> None:
     db.refresh(session)
     assert session.state == "stopped"
     assert session.ended_at is not None
+
+
+def test_dashboard_lists_hide_ended_unmanaged_sessions() -> None:
+    db = make_db()
+    now = utcnow()
+    agent = Agent(
+        id="agent-3",
+        display_name="Agent Three",
+        hostname="host",
+        status="online",
+        last_seen_at=now,
+        labels=[],
+        meta={},
+    )
+    sessions = [
+        ManagedSession(
+            id="managed-running",
+            agent_id="agent-3",
+            source="managed",
+            name="Managed Running",
+            state="running",
+            command="codex --no-alt-screen",
+            cwd=".",
+            started_at=now - timedelta(minutes=1),
+            last_heartbeat_at=now,
+            meta={},
+        ),
+        ManagedSession(
+            id="managed-stopped",
+            agent_id="agent-3",
+            source="managed",
+            name="Managed Stopped",
+            state="stopped",
+            command="codex --no-alt-screen",
+            cwd=".",
+            started_at=now - timedelta(minutes=2),
+            ended_at=now - timedelta(minutes=1),
+            last_heartbeat_at=now - timedelta(minutes=1),
+            meta={},
+        ),
+        ManagedSession(
+            id="unmanaged-running",
+            agent_id="agent-3",
+            source="unmanaged",
+            name="Unmanaged Running",
+            state="detected",
+            command="codex resume --last",
+            cwd=".",
+            started_at=now - timedelta(minutes=3),
+            last_heartbeat_at=now,
+            meta={},
+        ),
+        ManagedSession(
+            id="unmanaged-stopped",
+            agent_id="agent-3",
+            source="unmanaged",
+            name="Unmanaged Stopped",
+            state="stopped",
+            command="codex resume --last",
+            cwd=".",
+            started_at=now - timedelta(minutes=4),
+            ended_at=now - timedelta(minutes=3),
+            last_heartbeat_at=now - timedelta(minutes=3),
+            meta={},
+        ),
+    ]
+    db.add(agent)
+    db.add_all(sessions)
+    db.commit()
+
+    agent_sessions = get_agent_sessions(db, "agent-3")
+    assert [session.id for session in agent_sessions] == [
+        "managed-running",
+        "managed-stopped",
+        "unmanaged-running",
+    ]
+
+    overview = list_agents_with_sessions(db)
+    assert len(overview) == 1
+    assert [session.id for session in overview[0]["sessions"]] == [
+        "managed-running",
+        "managed-stopped",
+        "unmanaged-running",
+    ]

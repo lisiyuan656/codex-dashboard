@@ -21,6 +21,10 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
+def _show_in_dashboard(session: ManagedSession) -> bool:
+    return not (session.source == "unmanaged" and session.state in {"finished", "failed", "stopped"})
+
+
 def ensure_default_admin(db: Session, settings: Settings) -> None:
     user = db.scalar(select(User).where(User.username == settings.admin_username))
     if user is not None:
@@ -47,7 +51,7 @@ def refresh_staleness(db: Session, settings: Settings) -> None:
         last_seen_at = _as_utc(agent.last_seen_at)
         agent.status = "online" if last_seen_at and last_seen_at >= agent_cutoff else "offline"
 
-    active_states = {"launching", "running", "idle", "awaiting_approval", "stale"}
+    active_states = {"launching", "running", "idle", "awaiting_approval", "stale", "detected"}
     for session in db.scalars(select(ManagedSession).where(ManagedSession.state.in_(active_states))).all():
         if session.state in {"finished", "failed", "stopped"}:
             continue
@@ -121,7 +125,11 @@ def record_heartbeat(db: Session, agent_id: str, meta: dict[str, Any]) -> None:
 
 def list_agents_with_sessions(db: Session) -> list[dict[str, Any]]:
     agents = db.scalars(select(Agent).order_by(Agent.display_name)).all()
-    sessions = db.scalars(select(ManagedSession).order_by(ManagedSession.started_at.desc())).all()
+    sessions = [
+        session
+        for session in db.scalars(select(ManagedSession).order_by(ManagedSession.started_at.desc())).all()
+        if _show_in_dashboard(session)
+    ]
     by_agent: dict[str, list[ManagedSession]] = defaultdict(list)
     for session in sessions:
         by_agent[session.agent_id].append(session)
@@ -148,9 +156,13 @@ def get_agent_detail(db: Session, agent_id: str) -> Agent | None:
 
 
 def get_agent_sessions(db: Session, agent_id: str) -> list[ManagedSession]:
-    return db.scalars(
-        select(ManagedSession).where(ManagedSession.agent_id == agent_id).order_by(ManagedSession.started_at.desc())
-    ).all()
+    return [
+        session
+        for session in db.scalars(
+            select(ManagedSession).where(ManagedSession.agent_id == agent_id).order_by(ManagedSession.started_at.desc())
+        ).all()
+        if _show_in_dashboard(session)
+    ]
 
 
 def create_pending_session(
