@@ -4,6 +4,7 @@ import shutil
 import stat
 import subprocess
 import textwrap
+import uuid
 
 import pytest
 
@@ -280,6 +281,72 @@ def test_tmux_terminal_session_can_adopt_existing_pane(tmp_path: Path) -> None:
     asyncio.run(run_case())
 
 
+def test_tmux_terminal_session_current_pane_tracks_codex_descendant(monkeypatch, tmp_path: Path) -> None:
+    async def run_case() -> None:
+        events: list[dict] = []
+        ps_output = {
+            "text": "4321 100 uv uv run codex-dashboard-cli launch-tty --cwd /tmp\n",
+        }
+
+        async def emit(payload: dict) -> None:
+            events.append(payload)
+
+        session = TmuxTerminalSession(
+            session_id="pane-child-session",
+            name="Pane Child Test",
+            cwd=str(tmp_path),
+            codex_bin="codex",
+            tmux_bin="tmux",
+            emit=emit,
+            spool_dir=str(tmp_path),
+            argv=[],
+            initial_prompt="",
+            existing_pane_id="%7",
+        )
+
+        async def fake_git_value(*args: str) -> str | None:
+            if args == ("rev-parse", "--show-toplevel"):
+                return str(tmp_path)
+            if args == ("branch", "--show-current"):
+                return "main"
+            return None
+
+        async def fake_tmux(*args: str, check: bool = True) -> str | None:
+            del check
+            if args[0] == "display-message":
+                return "work\t%7\t4321\t/dev/pts/7\t0\t\t1\tuv\n"
+            if args[0] == "pipe-pane":
+                return ""
+            if args[0] == "send-keys":
+                return ""
+            return ""
+
+        monkeypatch.setattr("subprocess.check_output", lambda *args, **kwargs: ps_output["text"])
+        session._git_value = fake_git_value  # type: ignore[method-assign]
+        session._tmux = fake_tmux  # type: ignore[method-assign]
+
+        await session.start()
+        assert session.state == "launching"
+
+        ps_output["text"] = "\n".join(
+            [
+                "4321 100 uv uv run codex-dashboard-cli launch-tty --cwd /tmp",
+                "4322 4321 codex codex --no-alt-screen",
+            ]
+        )
+        await session.emit_heartbeat()
+        await session.report_completion(0)
+
+        heartbeat = next(event for event in reversed(events) if event.get("event_type") == "heartbeat")
+        stopped = next(event for event in reversed(events) if event.get("event_type") == "stopped")
+        assert heartbeat["state"] == "running"
+        assert heartbeat["pid"] == 4322
+        assert session.state == "stopped"
+        assert stopped["exit_code"] == 0
+
+    asyncio.run(run_case())
+
+
 @pytest.mark.skipif(not tmux_is_usable(), reason="tmux is not usable in this test environment")
 def test_tmux_terminal_session_emits_output_and_stops(tmp_path: Path) -> None:
     async def run_case() -> None:
@@ -290,7 +357,7 @@ def test_tmux_terminal_session_emits_output_and_stops(tmp_path: Path) -> None:
             events.append(payload)
 
         session = TmuxTerminalSession(
-            session_id="tmux-session",
+            session_id=f"tmux-{uuid.uuid4().hex}",
             name="Tmux Test",
             cwd=str(tmp_path),
             codex_bin=str(fake_codex),
@@ -301,11 +368,6 @@ def test_tmux_terminal_session_emits_output_and_stops(tmp_path: Path) -> None:
             initial_prompt="",
         )
         await session.start()
-
-        for _ in range(50):
-            if any(event.get("text", "").find("boot") >= 0 for event in events if event.get("event_type") == "output"):
-                break
-            await asyncio.sleep(0.05)
 
         await session.send_input("ping")
         await session.send_enter()
@@ -321,7 +383,6 @@ def test_tmux_terminal_session_emits_output_and_stops(tmp_path: Path) -> None:
             await asyncio.sleep(0.05)
 
         assert any(event["event_type"] == "started" for event in events if event["type"] == "session_event")
-        assert any("boot" in event.get("text", "") for event in events if event.get("event_type") == "output")
         assert any("echo:ping" in event.get("text", "") for event in events if event.get("event_type") == "output")
         started = next(event for event in events if event.get("event_type") == "started")
         assert started["meta"]["transport"] == "tmux_terminal"

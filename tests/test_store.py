@@ -6,7 +6,14 @@ from sqlalchemy.orm import Session as OrmSession
 from codex_dashboard.config import Settings
 from codex_dashboard.models import Agent, Base, Session as ManagedSession, SessionLock, User, utcnow
 from codex_dashboard.security import hash_password
-from codex_dashboard.store import acquire_lock, get_agent_sessions, list_agents_with_sessions, refresh_staleness, release_lock
+from codex_dashboard.store import (
+    acquire_lock,
+    get_agent_sessions,
+    ingest_session_event,
+    list_agents_with_sessions,
+    refresh_staleness,
+    release_lock,
+)
 
 
 def make_db() -> OrmSession:
@@ -215,3 +222,69 @@ def test_dashboard_lists_hide_ended_unmanaged_sessions() -> None:
         "managed-stopped",
         "unmanaged-running",
     ]
+
+
+def test_ingest_session_event_preserves_running_for_current_pane_tmux_sessions() -> None:
+    db = make_db()
+    now = utcnow()
+    agent = Agent(
+        id="agent-4",
+        display_name="Agent Four",
+        hostname="host",
+        status="online",
+        last_seen_at=now,
+        labels=[],
+        meta={},
+    )
+    session = ManagedSession(
+        id="session-4",
+        agent_id="agent-4",
+        source="managed",
+        name="Current Pane",
+        state="running",
+        command="codex --no-alt-screen",
+        cwd=".",
+        pid=4321,
+        started_at=now - timedelta(minutes=1),
+        last_heartbeat_at=now,
+        meta={"transport": "tmux_terminal", "tmux_launch_mode": "current_pane"},
+    )
+    db.add(agent)
+    db.add(session)
+    db.commit()
+
+    ingest_session_event(
+        db,
+        "agent-4",
+        {
+            "session_id": "session-4",
+            "event_type": "output",
+            "state": "launching",
+            "pid": 4321,
+            "text": "hello",
+            "meta": {
+                "transport": "tmux_terminal",
+                "tmux_launch_mode": "current_pane",
+                "pane_current_command": "uv",
+            },
+        },
+    )
+    ingest_session_event(
+        db,
+        "agent-4",
+        {
+            "session_id": "session-4",
+            "event_type": "heartbeat",
+            "state": "launching",
+            "pid": 4321,
+            "meta": {
+                "transport": "tmux_terminal",
+                "tmux_launch_mode": "current_pane",
+                "pane_current_command": "uv",
+            },
+        },
+    )
+
+    db.refresh(session)
+    assert session.state == "running"
+    assert "hello" in (session.last_output_excerpt or "")

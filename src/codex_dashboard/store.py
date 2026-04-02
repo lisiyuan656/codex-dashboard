@@ -25,6 +25,20 @@ def _show_in_dashboard(session: ManagedSession) -> bool:
     return not (session.source == "unmanaged" and session.state in {"finished", "failed", "stopped"})
 
 
+def _normalized_runtime_state(session: ManagedSession, payload_state: str | None) -> str | None:
+    if payload_state != "launching":
+        return payload_state
+    meta = session.meta or {}
+    if (
+        session.source == "managed"
+        and meta.get("transport") == "tmux_terminal"
+        and meta.get("tmux_launch_mode") == "current_pane"
+        and session.pid is not None
+    ):
+        return "running"
+    return payload_state
+
+
 def ensure_default_admin(db: Session, settings: Settings) -> None:
     user = db.scalar(select(User).where(User.username == settings.admin_username))
     if user is not None:
@@ -227,12 +241,12 @@ def ingest_session_event(db: Session, agent_id: str, payload: dict[str, Any]) ->
         session.state = "running"
         session.started_at = payload.get("started_at", session.started_at)
     elif event_type == "output":
-        session.state = payload.get("state", session.state or "running")
+        session.state = _normalized_runtime_state(session, payload.get("state")) or session.state or "running"
         chunk = payload.get("text", "")
         session.last_output_excerpt = ((session.last_output_excerpt or "") + chunk)[-4000:]
     elif event_type == "heartbeat":
         if session.state not in {"awaiting_approval", "stopped", "finished", "failed"}:
-            session.state = payload.get("state", "running")
+            session.state = _normalized_runtime_state(session, payload.get("state", "running")) or "running"
     elif event_type == "approval_requested":
         session.state = "awaiting_approval"
         db.add(

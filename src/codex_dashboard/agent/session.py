@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 import json
 from pathlib import Path
 import shlex
+import subprocess
 from typing import Any, Protocol
 
 
@@ -700,6 +701,42 @@ class TmuxTerminalSession(ManagedSessionBase):
         self._owns_session = existing_pane_id is None
         self._expected_commands = {Path(self.codex_bin).name, "codex"}
 
+    def _matches_expected_command(self, *, command: str, args: str) -> bool:
+        if command in self._expected_commands:
+            return True
+        argv0 = args.strip().split(None, 1)[0] if args.strip() else ""
+        return Path(argv0).name in self._expected_commands
+
+    def _find_descendant_codex_pid(self, root_pid: int) -> int | None:
+        try:
+            output = subprocess.check_output(["ps", "-eo", "pid=,ppid=,comm=,args="], text=True)
+        except Exception:
+            return None
+
+        children: dict[int, list[tuple[int, str, str]]] = {}
+        for line in output.splitlines():
+            parts = line.strip().split(None, 3)
+            if len(parts) < 3:
+                continue
+            pid_text, parent_text, command = parts[:3]
+            args = parts[3] if len(parts) == 4 else ""
+            if not pid_text.isdigit() or not parent_text.isdigit():
+                continue
+            children.setdefault(int(parent_text), []).append((int(pid_text), command, args))
+
+        pending = [root_pid]
+        seen = {root_pid}
+        while pending:
+            parent_pid = pending.pop(0)
+            for pid, command, args in children.get(parent_pid, []):
+                if pid in seen:
+                    continue
+                if self._matches_expected_command(command=command, args=args):
+                    return pid
+                seen.add(pid)
+                pending.append(pid)
+        return None
+
     @property
     def pid(self) -> int | None:
         return self._pid
@@ -895,9 +932,10 @@ class TmuxTerminalSession(ManagedSessionBase):
         if len(fields) != 8:
             raise TmuxSessionError(f"Unexpected tmux state line: {output!r}")
         session_name, pane_id, pane_pid, pane_tty, pane_dead, pane_dead_status, attached, pane_current_command = fields
+        pane_pid_int = int(pane_pid) if pane_pid.isdigit() else None
         self.session_name = session_name
         self.pane_id = pane_id
-        self._pid = int(pane_pid) if pane_pid.isdigit() else self._pid
+        self._pid = pane_pid_int if pane_pid_int is not None else self._pid
         self.pane_tty = pane_tty
         self.attached_clients = int(attached or "0")
         self._pane_current_command = pane_current_command
@@ -912,8 +950,13 @@ class TmuxTerminalSession(ManagedSessionBase):
             self.state = "running"
             return
 
-        if pane_current_command in self._expected_commands:
+        codex_pid = pane_pid_int if self._matches_expected_command(command=pane_current_command, args=pane_current_command) else None
+        if codex_pid is None and pane_pid_int is not None:
+            codex_pid = self._find_descendant_codex_pid(pane_pid_int)
+
+        if codex_pid is not None:
             self._observed_foreground_codex = True
+            self._pid = codex_pid
             self.state = "running"
             return
 
