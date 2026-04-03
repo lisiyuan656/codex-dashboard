@@ -20,7 +20,7 @@ This repository contains an MVP implementation of the plan:
 - terminal sessions are the default managed path; app-server sessions remain available as a secondary mode
 - approval handling is structured only for app-server sessions; tmux terminal sessions use raw terminal input
 
-## Quick Start
+## Development Quick Start
 
 1. Install dependencies:
 
@@ -65,7 +65,7 @@ You can also launch a managed session without the browser:
 export CODEX_DASHBOARD_URL="http://127.0.0.1:8000"
 export CODEX_DASHBOARD_USERNAME="admin"
 export CODEX_DASHBOARD_PASSWORD="replace-me"
-uv run codex-dashboard-cli launch \
+codex-dashboard-cli launch \
   --agent workstation-omarchy \
   --cwd /mnt/data/Projects/codex-dashboard \
   --name "CLI Managed Session" \
@@ -73,7 +73,7 @@ uv run codex-dashboard-cli launch \
   -- resume --last
 ```
 
-The remote `launch` command defaults to terminal mode. Add `--mode app_server` if you want the older browser-only native app-server flow. If you omit `--prompt`, the session starts idle. If you omit `--password`, the CLI will prompt for it.
+The remote `launch` command defaults to terminal mode. Add `--mode app_server` if you want the older browser-only native app-server flow. If you omit `--prompt`, the session starts idle. If you omit `--password`, the CLI will prompt for it. If you are only using the repo-local dev environment, prefix the command with `uv run`.
 
 ## Shell Alias
 
@@ -81,11 +81,98 @@ On a managed host, you can replace your usual `codex` launch with a shell functi
 
 ```bash
 codex() {
-  uv run codex-dashboard-cli launch-tty --cwd "$PWD" -- "$@"
+  codex-dashboard-cli launch-tty --cwd "$PWD" -- "$@"
 }
 ```
 
 This keeps your workflow terminal-first while the dashboard gains visibility over the session. When run inside tmux, the wrapper now reuses the current pane instead of forcing a second tmux session.
+
+## Recommended Deployment on a Machine
+
+For a real workstation or remote box, do not keep using `uv run`. Install the package once and run the agent as a `systemd --user` service.
+
+1. Install the commands persistently:
+
+```bash
+cd /path/to/codex-dashboard
+uv tool install --editable .
+uv tool update-shell
+```
+
+This makes `codex-dashboard-agent` and `codex-dashboard-cli` available directly on `PATH`.
+
+2. Install the user service:
+
+```bash
+mkdir -p ~/.config/systemd/user ~/.config/codex-dashboard-agent
+cp systemd/codex-dashboard-agent.service ~/.config/systemd/user/
+cp systemd/codex-dashboard-agent.env.example ~/.config/codex-dashboard-agent/agent.env
+$EDITOR ~/.config/codex-dashboard-agent/agent.env
+systemctl --user daemon-reload
+systemctl --user enable --now codex-dashboard-agent.service
+```
+
+Optional, if you want the user service to keep running after logout:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
+3. Enable Codex hooks for CLI/tmux status reporting:
+
+```bash
+codex-dashboard-cli install-cli-hooks
+```
+
+4. Wrap your normal Codex command:
+
+```bash
+codex() {
+  codex-dashboard-cli launch-tty --cwd "$PWD" -- "$@"
+}
+```
+
+After that, new tmux sessions launched through the wrapper are tracked without `uv run`, and the agent survives shell exits.
+
+## Docker Deployment for the Server
+
+The dashboard server can be run under Docker Compose. This is only for the web/server process; `codex-dashboard-agent` still runs on the monitored Linux machines outside the container.
+
+1. Create the server env file:
+
+```bash
+cp docker/server.env.example docker/server.env
+mkdir -p docker/data
+$EDITOR docker/server.env
+```
+
+2. Build and start the container:
+
+```bash
+docker compose --env-file docker/server.env up -d --build
+```
+
+3. Check status:
+
+```bash
+docker compose ps
+docker compose logs -f codex-dashboard-server
+```
+
+4. Stop or upgrade:
+
+```bash
+docker compose down
+docker compose --env-file docker/server.env up -d --build
+```
+
+The compose stack stores the default SQLite database in the host directory from `CODEX_DASHBOARD_DATA_DIR`, which defaults to `./docker/data`. That makes backups straightforward, for example:
+
+```bash
+tar -czf codex-dashboard-backup.tgz docker/data
+```
+
+If you want PostgreSQL instead, set `CODEX_DASHBOARD_DATABASE_URL` in `docker/server.env` to a PostgreSQL connection string. The bind mount can stay in place or be removed if you no longer need local SQLite storage.
 
 ## Configuration
 
@@ -103,8 +190,10 @@ This keeps your workflow terminal-first while the dashboard gains visibility ove
 
 - `CODEX_DASHBOARD_AGENT_WS_URL`
 - `CODEX_DASHBOARD_AGENT_ID`
+- `CODEX_DASHBOARD_AGENT_DISPLAY_NAME`
 - `CODEX_DASHBOARD_AGENT_TOKEN`
 - `CODEX_DASHBOARD_AGENT_LABELS`
+- `CODEX_DASHBOARD_CODEX_BIN`
 - `CODEX_DASHBOARD_AGENT_HEARTBEAT_SECONDS`
 - `CODEX_DASHBOARD_AGENT_WATCH_SECONDS`
 - `CODEX_DASHBOARD_AGENT_SOCKET_PATH`

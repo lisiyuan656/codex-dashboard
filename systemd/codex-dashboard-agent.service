@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=CODEX_DASHBOARD_AGENT_WS_URL=ws://127.0.0.1:8000/ws/agent
-Environment=CODEX_DASHBOARD_AGENT_TOKEN=change-me
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-%h/.config/codex-dashboard-agent/agent.env
 ExecStart=/usr/bin/env codex-dashboard-agent
 Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

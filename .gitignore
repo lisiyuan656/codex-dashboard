@@ -3,3 +3,7 @@ __pycache__/
 .pytest_cache/
 *.pyc
 codex_dashboard.db
+.env
+docker/server.env
+docker/data/*
+!docker/data/.gitkeep

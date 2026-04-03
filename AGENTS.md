@@ -5,8 +5,10 @@ Core application code lives in `src/codex_dashboard/`. The FastAPI server entryp
 
 ## Build, Test, and Development Commands
 - `uv sync --extra dev`: install runtime and test dependencies.
+- `uv tool install --editable .`: install persistent `codex-dashboard-*` commands for workstation use without `uv run`.
 - `uv run codex-dashboard-server`: start the FastAPI dashboard locally.
 - `uv run codex-dashboard-agent`: start the local machine agent.
+- `docker compose --env-file docker/server.env up -d --build`: build and run the dashboard server in Docker.
 - `uv run codex-dashboard-cli launch-tty --cwd "$PWD" -- resume --last`: launch a managed tmux-backed Codex session from the current shell.
 - `uv run codex-dashboard-cli install-cli-hooks`: install the dashboard’s Codex hooks into `~/.codex`.
 - `uv run python -m pytest`: run the full test suite.
