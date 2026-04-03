@@ -14,7 +14,7 @@ import uuid
 import websockets
 
 from .config import AgentConfig
-from .session import AppServerSession, SessionRuntime, TmuxTerminalSession
+from .session import AppServerSession, CliHookSession, SessionRuntime, TmuxTerminalSession
 
 
 class DashboardAgent:
@@ -95,8 +95,11 @@ class DashboardAgent:
 
     async def _watch_loop(self) -> None:
         while True:
-            for item in self._discover_unmanaged_codex():
-                await self.emit({"type": "session_event", "event_type": "detected", **item})
+            processes = self._codex_processes()
+            if processes is not None:
+                await self._reconcile_hook_sessions(processes)
+                for item in self._discover_unmanaged_codex(processes):
+                    await self.emit({"type": "session_event", "event_type": "detected", **item})
             await asyncio.sleep(self.config.watch_seconds)
 
     async def _handle_action(self, payload: dict[str, Any]) -> None:
@@ -240,9 +243,13 @@ class DashboardAgent:
                     repo_path=item.get("repo_path"),
                     git_branch=item.get("git_branch"),
                     pid=item.get("pid"),
+                    state=item.get("state"),
                     pane_tty=item.get("pane_tty"),
                     attached_clients=int(item.get("attached_clients") or 0),
                     pane_current_command=item.get("pane_current_command"),
+                    codex_session_id=item.get("codex_session_id"),
+                    status_detail=item.get("status_detail"),
+                    last_hook_event=item.get("last_hook_event"),
                 )
                 await session.sync()
                 if not session.is_alive:
@@ -340,6 +347,11 @@ class DashboardAgent:
                 session = self._require_session(session_id)
                 return {"ok": True, "session": self._session_snapshot(session)}
             return {"ok": True, "sessions": [self._session_snapshot(session) for session in self.sessions.values()]}
+        if request_type == "hook_event":
+            hook = payload.get("hook", {})
+            if not isinstance(hook, dict):
+                raise RuntimeError("hook payload must be an object")
+            return await self._handle_hook_event(hook)
         raise RuntimeError(f"Unsupported local request: {request_type}")
 
     def _require_session(self, session_id: str, *, transport: str | None = None) -> SessionRuntime:
@@ -365,6 +377,41 @@ class DashboardAgent:
         for session in list(self.sessions.values()):
             await session.sync()
 
+    async def _handle_hook_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        dashboard_session_id = payload.get("dashboard_session_id")
+        if dashboard_session_id:
+            session = self.sessions.get(dashboard_session_id)
+            if isinstance(session, TmuxTerminalSession):
+                await session.apply_hook_event(payload)
+                return {"ok": True, "session": self._session_snapshot(session)}
+            return {"ok": True, "ignored": True}
+
+        pid = payload.get("pid")
+        if pid is None:
+            return {"ok": True, "ignored": True}
+
+        session_id = f"unmanaged-{self.config.agent_id}-{pid}"
+        session = self.sessions.get(session_id)
+        if not isinstance(session, CliHookSession):
+            session = CliHookSession(
+                session_id=session_id,
+                name=payload.get("name", f"CLI Codex {pid}"),
+                cwd=payload.get("cwd", "."),
+                command=payload.get("command", self.config.codex_bin),
+                transport=payload.get("transport", "cli_terminal"),
+                pid=pid,
+                tty=payload.get("tty"),
+                tmux_pane=payload.get("tmux_pane"),
+                codex_session_id=payload.get("codex_session_id"),
+                state=payload.get("state", "running"),
+                status_detail=payload.get("status_detail"),
+                emit=self.emit,
+            )
+            self.sessions[session_id] = session
+
+        await session.apply_hook_event(payload)
+        return {"ok": True, "session": self._session_snapshot(session)}
+
     def _machine_meta(self) -> dict[str, Any]:
         return {
             "platform": platform.platform(),
@@ -375,20 +422,32 @@ class DashboardAgent:
             "spool_dir": self.config.spool_dir,
         }
 
-    def _discover_unmanaged_codex(self) -> Iterable[dict[str, Any]]:
-        managed_pids: set[int] = set()
-        managed_ttys: set[str] = set()
-        for session in self.sessions.values():
-            managed_pids.update(session.discovery_pids())
-            managed_ttys.update(session.discovery_ttys())
+    async def _reconcile_hook_sessions(self, processes: Iterable[dict[str, Any]]) -> None:
+        live_pids = {item["pid"] for item in processes}
+        live_ttys: set[str] = set()
+        for item in processes:
+            tty = item.get("tty")
+            if not tty or tty == "?":
+                continue
+            live_ttys.add(tty)
+            live_ttys.add(f"/dev/{tty}")
 
+        for session_id, session in list(self.sessions.items()):
+            if not isinstance(session, CliHookSession):
+                continue
+            if (session.pid is not None and session.pid in live_pids) or session.discovery_ttys().intersection(live_ttys):
+                continue
+            await session.report_completion(None)
+            self.sessions.pop(session_id, None)
+
+    def _codex_processes(self) -> list[dict[str, Any]] | None:
         codex_names = {Path(self.config.codex_bin).name}
         try:
             output = subprocess.check_output(["ps", "-eo", "pid=,comm=,tty=,args="], text=True)
         except Exception:
-            return []
+            return None
 
-        discovered = []
+        processes = []
         for line in output.splitlines():
             parts = line.strip().split(None, 3)
             if len(parts) < 4:
@@ -399,6 +458,29 @@ class DashboardAgent:
             args = parts[3]
             if comm not in codex_names:
                 continue
+            processes.append(
+                {
+                    "pid": pid,
+                    "comm": comm,
+                    "tty": tty,
+                    "args": args,
+                }
+            )
+        return processes
+
+    def _discover_unmanaged_codex(self, processes: Iterable[dict[str, Any]] | None = None) -> Iterable[dict[str, Any]]:
+        managed_pids: set[int] = set()
+        managed_ttys: set[str] = set()
+        for session in self.sessions.values():
+            managed_pids.update(session.discovery_pids())
+            managed_ttys.update(session.discovery_ttys())
+
+        processes = list(processes or self._codex_processes() or [])
+        discovered = []
+        for item in processes:
+            pid = item["pid"]
+            tty = item["tty"]
+            args = item["args"]
             if pid in managed_pids or tty in managed_ttys:
                 continue
             discovered.append(

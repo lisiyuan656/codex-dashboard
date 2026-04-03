@@ -5,7 +5,7 @@
 <div class="card">
   <div class="toolbar">
     <h1 style="margin: 0;">{{ session.name }}</h1>
-    <span class="pill status-{{ session.state }}">{{ session.state }}</span>
+    <span class="pill status-{{ session.state }}" id="state-badge">{{ display_session_state(session) }}</span>
     <span class="pill">{{ transport }}</span>
   </div>
   <p class="meta">{{ session.command }}</p>
@@ -24,6 +24,11 @@
   {% endif %}
   {% if session.meta.get("tmux_launch_mode") %}
   <p class="meta">Tmux mode: {{ session.meta.get("tmux_launch_mode") }}</p>
+  {% endif %}
+  {% if session_status_detail(session) %}
+  <p class="meta" id="status-detail">Status: {{ session_status_detail(session) }}</p>
+  {% else %}
+  <p class="meta" id="status-detail" hidden></p>
   {% endif %}
   {% if transport == "tmux_terminal" %}
   <p class="meta">Attached tmux clients: {{ session.meta.get("attached_clients", 0) }}</p>
@@ -108,6 +113,9 @@
   const lockState = document.getElementById("lock-state");
   const lockButton = document.getElementById("lock-button");
   const inputBox = document.getElementById("input-box");
+  const stateBadge = document.getElementById("state-badge");
+  const statusDetail = document.getElementById("status-detail");
+  const transport = "{{ transport }}";
 
   function sanitizeTerminalOutput(text) {
     return text
@@ -139,6 +147,33 @@
       <pre class="session-output" style="min-height: 80px;">${JSON.stringify(payload, null, 2)}</pre>
     `;
     eventList.prepend(card);
+  }
+
+  function displayState(summary) {
+    if (!summary) return "";
+    if ((transport === "tmux_terminal" || transport === "cli_terminal") && summary.state === "idle") {
+      return "waiting for input";
+    }
+    return (summary.state || "").replaceAll("_", " ");
+  }
+
+  function updateSummary(summary) {
+    if (!summary) return;
+    stateBadge.textContent = displayState(summary);
+    stateBadge.className = `pill status-${summary.state}`;
+    const detail = (summary.meta || {}).status_detail;
+    if (detail) {
+      statusDetail.hidden = false;
+      statusDetail.textContent = `Status: ${detail}`;
+      return;
+    }
+    if ((transport === "tmux_terminal" || transport === "cli_terminal") && summary.state === "idle") {
+      statusDetail.hidden = false;
+      statusDetail.textContent = "Status: Waiting for input";
+      return;
+    }
+    statusDetail.hidden = true;
+    statusDetail.textContent = "";
   }
 
   async function postJson(url, payload) {
@@ -236,7 +271,8 @@
         prependEvent(payload.event_type, payload.payload);
       }
       if (payload.summary) {
-        document.title = `${payload.summary.state} • {{ session.name }}`;
+        updateSummary(payload.summary);
+        document.title = `${displayState(payload.summary)} • {{ session.name }}`;
       }
     }
     if (payload.type === "lock_changed") {

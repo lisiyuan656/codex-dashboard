@@ -51,9 +51,29 @@ def _is_authenticated(request: Request, db: Session) -> bool:
 
 def _transport_for(session: Any) -> str:
     meta = session.meta or {}
-    if session.source == "unmanaged":
-        return "unmanaged"
-    return meta.get("transport", "app_server")
+    return meta.get("transport", "app_server" if session.source == "managed" else "unmanaged")
+
+
+def _display_session_state(session: Any) -> str:
+    transport = _transport_for(session)
+    if transport in {"tmux_terminal", "cli_terminal"} and session.state == "idle":
+        return "waiting for input"
+    return session.state.replace("_", " ")
+
+
+def _session_status_detail(session: Any) -> str | None:
+    meta = session.meta or {}
+    detail = meta.get("status_detail")
+    if detail:
+        return detail
+    transport = _transport_for(session)
+    if transport in {"tmux_terminal", "cli_terminal"} and session.state == "idle":
+        return "Waiting for input"
+    return None
+
+
+templates.env.globals["display_session_state"] = _display_session_state
+templates.env.globals["session_status_detail"] = _session_status_detail
 
 
 def create_app() -> FastAPI:

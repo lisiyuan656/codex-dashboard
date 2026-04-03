@@ -99,6 +99,149 @@ class AppServerProtocolError(RuntimeError):
     pass
 
 
+class CliHookSession(ManagedSessionBase):
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        name: str,
+        cwd: str,
+        command: str,
+        transport: str,
+        pid: int | None,
+        tty: str | None,
+        tmux_pane: str | None,
+        codex_session_id: str | None,
+        state: str,
+        status_detail: str | None,
+        emit: EventCallback,
+    ) -> None:
+        super().__init__(session_id=session_id, name=name, cwd=cwd, emit=emit)
+        self.command = command
+        self.transport = transport
+        self._pid = pid
+        self.tty = tty
+        self.tmux_pane = tmux_pane
+        self.codex_session_id = codex_session_id
+        self.state = state
+        self.status_detail = status_detail
+        self.last_hook_event: str | None = None
+        self._alive = True
+
+    @property
+    def pid(self) -> int | None:
+        return self._pid
+
+    @property
+    def is_alive(self) -> bool:
+        return self._alive and self.state not in {"stopped", "finished", "failed"}
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        await self._finalize("stopped", None)
+
+    async def send_input(self, text: str) -> None:
+        del text
+        raise RuntimeError("unmanaged CLI sessions do not support dashboard input")
+
+    async def apply_hook_event(self, payload: dict[str, Any]) -> None:
+        if payload.get("pid") is not None:
+            self._pid = payload["pid"]
+        if payload.get("tty"):
+            self.tty = payload["tty"]
+        if payload.get("tmux_pane"):
+            self.tmux_pane = payload["tmux_pane"]
+            self.transport = "tmux_terminal"
+        if payload.get("command"):
+            self.command = payload["command"]
+        if payload.get("cwd"):
+            self.cwd = payload["cwd"]
+        if payload.get("name"):
+            self.name = payload["name"]
+        if payload.get("codex_session_id"):
+            self.codex_session_id = payload["codex_session_id"]
+        self.state = payload.get("state", self.state)
+        self.status_detail = payload.get("status_detail", self.status_detail)
+        self.last_hook_event = payload.get("hook_event_name", self.last_hook_event)
+        await self.emit(
+            {
+                "type": "session_event",
+                "event_type": "hook_status",
+                "session_id": self.session_id,
+                "state": self.state,
+                "name": self.name,
+                "command": self.command,
+                "cwd": self.cwd,
+                "pid": self.pid,
+                "source": "unmanaged",
+                "meta": self._meta(),
+            }
+        )
+
+    async def emit_heartbeat(self) -> None:
+        if not self.is_alive:
+            return
+        await self.emit(
+            {
+                "type": "session_event",
+                "event_type": "heartbeat",
+                "session_id": self.session_id,
+                "state": self.state,
+                "name": self.name,
+                "command": self.command,
+                "cwd": self.cwd,
+                "pid": self.pid,
+                "source": "unmanaged",
+                "meta": self._meta(),
+            }
+        )
+
+    async def sync(self) -> None:
+        await self.emit_heartbeat()
+
+    async def report_completion(self, exit_code: int | None) -> None:
+        await self._finalize("stopped", exit_code)
+
+    def discovery_ttys(self) -> set[str]:
+        if not self.tty:
+            return set()
+        tty = self.tty.removeprefix("/dev/")
+        return {self.tty, tty}
+
+    async def _finalize(self, state: str, exit_code: int | None) -> None:
+        if not self._alive and self.state == state:
+            return
+        self._alive = False
+        self.state = state
+        await self.emit(
+            {
+                "type": "session_event",
+                "event_type": "failed" if state == "failed" else "stopped",
+                "session_id": self.session_id,
+                "state": state,
+                "exit_code": exit_code,
+                "name": self.name,
+                "command": self.command,
+                "cwd": self.cwd,
+                "pid": self.pid,
+                "source": "unmanaged",
+                "meta": self._meta(),
+            }
+        )
+
+    def _meta(self) -> dict[str, Any]:
+        return {
+            "transport": self.transport,
+            "tty": self.tty,
+            "tmux_pane": self.tmux_pane,
+            "codex_session_id": self.codex_session_id,
+            "status_detail": self.status_detail,
+            "last_hook_event": self.last_hook_event,
+        }
+
+
 class AppServerSession(ManagedSessionBase):
     transport = "app_server"
 
@@ -702,6 +845,10 @@ class TmuxTerminalSession(ManagedSessionBase):
         self._pipe_started = False
         self._owns_session = existing_pane_id is None
         self._expected_commands = {Path(self.codex_bin).name, "codex"}
+        self._hook_state: str | None = None
+        self._hook_status_detail: str | None = None
+        self._hook_last_event: str | None = None
+        self._codex_session_id: str | None = None
 
     def _matches_expected_command(self, *, command: str, args: str) -> bool:
         if command in self._expected_commands:
@@ -759,7 +906,7 @@ class TmuxTerminalSession(ManagedSessionBase):
         self.git_branch = await self._git_value("branch", "--show-current")
 
         if self._owns_session:
-            shell_command = f"exec {self.command}"
+            shell_command = f"exec env CODEX_DASHBOARD_SESSION_ID={shlex.quote(self.session_id)} {self.command}"
             await self._tmux("new-session", "-d", "-s", self._requested_session_name, "-c", self.cwd, shell_command)
             await self._tmux("set-option", "-t", self._requested_session_name, "remain-on-exit", "on")
         await self._refresh_tmux_state()
@@ -816,9 +963,13 @@ class TmuxTerminalSession(ManagedSessionBase):
         repo_path: str | None,
         git_branch: str | None,
         pid: int | None,
+        state: str | None,
         pane_tty: str | None,
         attached_clients: int,
         pane_current_command: str | None,
+        codex_session_id: str | None,
+        status_detail: str | None,
+        last_hook_event: str | None,
     ) -> None:
         self.session_name = session_name
         self.repo_path = repo_path
@@ -828,6 +979,12 @@ class TmuxTerminalSession(ManagedSessionBase):
         self.attached_clients = attached_clients
         self._pane_current_command = pane_current_command
         self._owns_session = launch_mode != "current_pane"
+        self._codex_session_id = codex_session_id
+        self._hook_status_detail = status_detail
+        self._hook_last_event = last_hook_event
+        if state in {"idle", "running"}:
+            self._hook_state = state
+            self.state = state
         self._pipe_started = True
         if self.log_path.exists():
             self._log_offset = self.log_path.stat().st_size
@@ -914,6 +1071,37 @@ class TmuxTerminalSession(ManagedSessionBase):
     async def resolve_approval(self, *, approved: bool, approval_id: str) -> None:
         raise RuntimeError("tmux terminal sessions do not support structured approvals")
 
+    async def apply_hook_event(self, payload: dict[str, Any]) -> None:
+        if self._final_event_sent:
+            return
+        if payload.get("pid") is not None:
+            self._pid = payload["pid"]
+        if payload.get("tty"):
+            self.pane_tty = payload["tty"]
+        if payload.get("codex_session_id"):
+            self._codex_session_id = payload["codex_session_id"]
+        self._hook_state = payload.get("state", self._hook_state)
+        self._hook_status_detail = payload.get("status_detail", self._hook_status_detail)
+        self._hook_last_event = payload.get("hook_event_name", self._hook_last_event)
+        if self._hook_state:
+            self.state = self._hook_state
+        await self.emit(
+            {
+                "type": "session_event",
+                "event_type": "hook_status",
+                "session_id": self.session_id,
+                "state": self.state,
+                "name": self.name,
+                "command": self.command,
+                "cwd": self.cwd,
+                "pid": self.pid,
+                "source": "managed",
+                "repo_path": self.repo_path,
+                "git_branch": self.git_branch,
+                "meta": self._meta(),
+            }
+        )
+
     async def _log_loop(self) -> None:
         while True:
             await self._drain_log()
@@ -979,7 +1167,7 @@ class TmuxTerminalSession(ManagedSessionBase):
             return
 
         if self._owns_session:
-            self.state = "running"
+            self.state = self._hook_state or "running"
             return
 
         codex_pid = pane_pid_int if self._matches_expected_command(command=pane_current_command, args=pane_current_command) else None
@@ -989,7 +1177,7 @@ class TmuxTerminalSession(ManagedSessionBase):
         if codex_pid is not None:
             self._observed_foreground_codex = True
             self._pid = codex_pid
-            self.state = "running"
+            self.state = self._hook_state or "running"
             return
 
         if self._completion_reported:
@@ -1079,4 +1267,7 @@ class TmuxTerminalSession(ManagedSessionBase):
             "tmux_launch_mode": "detached_session" if self._owns_session else "current_pane",
             "pane_current_command": self._pane_current_command,
             "argv": self.argv,
+            "codex_session_id": self._codex_session_id,
+            "status_detail": self._hook_status_detail,
+            "last_hook_event": self._hook_last_event,
         }

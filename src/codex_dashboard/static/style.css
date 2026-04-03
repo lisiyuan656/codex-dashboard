@@ -83,6 +83,10 @@ main {
   color: var(--warn);
 }
 
+.status-idle {
+  color: var(--accent);
+}
+
 .meta {
   color: var(--muted);
   font-size: 0.9rem;

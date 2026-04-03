@@ -371,6 +371,9 @@ def test_get_recoverable_agent_sessions_returns_only_live_tmux_sessions() -> Non
                     "tmux_pane": "%7",
                     "tmux_session": "work",
                     "argv": ["resume", "--last"],
+                    "codex_session_id": "codex-session",
+                    "status_detail": "Waiting for input",
+                    "last_hook_event": "Stop",
                 },
             ),
             ManagedSession(
@@ -415,8 +418,66 @@ def test_get_recoverable_agent_sessions_returns_only_live_tmux_sessions() -> Non
             "repo_path": None,
             "git_branch": None,
             "pid": 111,
+            "state": "running",
             "pane_tty": None,
             "attached_clients": 0,
             "pane_current_command": None,
+            "codex_session_id": "codex-session",
+            "status_detail": "Waiting for input",
+            "last_hook_event": "Stop",
         }
     ]
+
+
+def test_ingest_hook_status_updates_unmanaged_cli_session_state() -> None:
+    db = make_db()
+    now = utcnow()
+    agent = Agent(
+        id="agent-6",
+        display_name="Agent Six",
+        hostname="host",
+        status="online",
+        last_seen_at=now,
+        labels=[],
+        meta={},
+    )
+    session = ManagedSession(
+        id="unmanaged-agent-6-4321",
+        agent_id="agent-6",
+        source="unmanaged",
+        name="CLI Codex 4321",
+        state="detected",
+        command="codex --no-alt-screen",
+        cwd="/repo",
+        pid=4321,
+        started_at=now - timedelta(minutes=1),
+        last_heartbeat_at=now,
+        meta={"transport": "cli_terminal"},
+    )
+    db.add(agent)
+    db.add(session)
+    db.commit()
+
+    ingest_session_event(
+        db,
+        "agent-6",
+        {
+            "session_id": "unmanaged-agent-6-4321",
+            "event_type": "hook_status",
+            "state": "idle",
+            "pid": 4321,
+            "source": "unmanaged",
+            "meta": {
+                "transport": "cli_terminal",
+                "codex_session_id": "codex-session",
+                "status_detail": "Waiting for input",
+                "last_hook_event": "Stop",
+                "tty": "pts/8",
+            },
+        },
+    )
+
+    db.refresh(session)
+    assert session.state == "idle"
+    assert session.meta["codex_session_id"] == "codex-session"
+    assert session.meta["status_detail"] == "Waiting for input"

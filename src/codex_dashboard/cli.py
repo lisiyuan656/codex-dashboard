@@ -15,6 +15,8 @@ import urllib.parse
 import urllib.request
 from http.cookiejar import CookieJar
 
+from .codex_hooks import install_cli_hooks, normalize_hook_event
+
 
 class DashboardCliError(RuntimeError):
     pass
@@ -169,10 +171,13 @@ def complete_local_terminal_session(*, socket_path: str, session_id: str, exit_c
     )
 
 
-def _run_foreground_codex(*, cwd: str, argv: list[str]) -> int:
+def _run_foreground_codex(*, cwd: str, argv: list[str], dashboard_session_id: str | None = None) -> int:
     command = [_codex_bin(), "--no-alt-screen", *argv]
+    env = os.environ.copy()
+    if dashboard_session_id:
+        env["CODEX_DASHBOARD_SESSION_ID"] = dashboard_session_id
     try:
-        process = subprocess.Popen(command, cwd=cwd)
+        process = subprocess.Popen(command, cwd=cwd, env=env)
     except FileNotFoundError:
         print(f"error: failed to launch {_codex_bin()}", file=sys.stderr)
         return 127
@@ -229,6 +234,18 @@ def _build_parser() -> argparse.ArgumentParser:
     launch_tty.add_argument("--detach", action="store_true", help="Do not attach to tmux after creating the session.")
     launch_tty.add_argument("codex_args", nargs=argparse.REMAINDER, help="Codex args after --.")
 
+    install_hooks = subparsers.add_parser(
+        "install-cli-hooks",
+        help="Install the dashboard Codex hooks into ~/.codex for tmux/CLI session status tracking.",
+    )
+    install_hooks.add_argument("--config-path", default=None)
+    install_hooks.add_argument("--hooks-path", default=None)
+
+    subparsers.add_parser(
+        "hook-event",
+        help="Internal entrypoint for Codex hooks to report tmux/CLI status into the local dashboard agent.",
+    )
+
     return parser
 
 
@@ -283,7 +300,7 @@ def main() -> None:
         attach_command = meta.get("attach_command")
         session_id = result.get("session_id")
         if tmux_pane and session_id:
-            exit_code = _run_foreground_codex(cwd=args.cwd, argv=codex_args)
+            exit_code = _run_foreground_codex(cwd=args.cwd, argv=codex_args, dashboard_session_id=session_id)
             try:
                 complete_local_terminal_session(
                     socket_path=args.socket_path,
@@ -306,6 +323,24 @@ def main() -> None:
                 indent=2,
             )
         )
+        return
+
+    if args.command == "install-cli-hooks":
+        result = install_cli_hooks(
+            config_path=Path(args.config_path).expanduser() if args.config_path else None,
+            hooks_path=Path(args.hooks_path).expanduser() if args.hooks_path else None,
+        )
+        print(json.dumps({"ok": True, **result}, indent=2))
+        return
+
+    if args.command == "hook-event":
+        try:
+            payload = json.loads(sys.stdin.read() or "{}")
+            normalized = normalize_hook_event(payload)
+            if normalized is not None:
+                _post_local_socket(_default_socket_path(), {"type": "hook_event", "hook": normalized})
+        except Exception as exc:
+            print(f"warning: dashboard hook event ignored: {exc}", file=sys.stderr)
         return
 
     parser.error(f"Unsupported command: {args.command}")

@@ -25,10 +25,13 @@
       <div class="card">
         <div class="toolbar">
           <strong>{{ session.name }}</strong>
-          <span class="pill status-{{ session.state }}">{{ session.state }}</span>
+          <span class="pill status-{{ session.state }}">{{ display_session_state(session) }}</span>
           <span class="pill">{{ session.meta.get("transport", session.source) }}</span>
         </div>
         <div class="meta">{{ session.command }}</div>
+        {% if session_status_detail(session) %}
+        <div class="meta">{{ session_status_detail(session) }}</div>
+        {% endif %}
         <a href="/sessions/{{ session.id }}">View session</a>
       </div>
       {% else %}

@@ -213,9 +213,13 @@ def get_recoverable_agent_sessions(db: Session, agent_id: str) -> list[dict[str,
                 "repo_path": session.repo_path,
                 "git_branch": session.git_branch,
                 "pid": session.pid,
+                "state": session.state,
                 "pane_tty": meta.get("pane_tty"),
                 "attached_clients": meta.get("attached_clients", 0),
                 "pane_current_command": meta.get("pane_current_command"),
+                "codex_session_id": meta.get("codex_session_id"),
+                "status_detail": meta.get("status_detail"),
+                "last_hook_event": meta.get("last_hook_event"),
             }
         )
     return recoverable
@@ -289,6 +293,9 @@ def ingest_session_event(db: Session, agent_id: str, payload: dict[str, Any]) ->
     elif event_type == "heartbeat":
         if session.state not in {"awaiting_approval", "stopped", "finished", "failed"}:
             session.state = _normalized_runtime_state(session, payload.get("state", "running")) or "running"
+    elif event_type == "hook_status":
+        if session.state not in {"stopped", "finished", "failed"}:
+            session.state = payload.get("state", session.state) or session.state or "running"
     elif event_type == "approval_requested":
         session.state = "awaiting_approval"
         db.add(
@@ -342,6 +349,7 @@ def session_summary(session: ManagedSession) -> dict[str, Any]:
         "ended_at": session.ended_at.isoformat() if session.ended_at else None,
         "last_heartbeat_at": session.last_heartbeat_at.isoformat() if session.last_heartbeat_at else None,
         "last_output_excerpt": session.last_output_excerpt or "",
+        "meta": session.meta or {},
     }
 
 

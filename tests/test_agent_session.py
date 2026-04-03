@@ -347,6 +347,69 @@ def test_tmux_terminal_session_current_pane_tracks_codex_descendant(monkeypatch,
     asyncio.run(run_case())
 
 
+def test_tmux_terminal_session_uses_hook_state_for_idle(monkeypatch, tmp_path: Path) -> None:
+    async def run_case() -> None:
+        events: list[dict] = []
+
+        async def emit(payload: dict) -> None:
+            events.append(payload)
+
+        session = TmuxTerminalSession(
+            session_id="hook-state-session",
+            name="Hook State Test",
+            cwd=str(tmp_path),
+            codex_bin="codex",
+            tmux_bin="tmux",
+            emit=emit,
+            spool_dir=str(tmp_path),
+            argv=[],
+            initial_prompt="",
+            existing_pane_id="%7",
+        )
+
+        async def fake_git_value(*args: str) -> str | None:
+            if args == ("rev-parse", "--show-toplevel"):
+                return str(tmp_path)
+            if args == ("branch", "--show-current"):
+                return "main"
+            return None
+
+        async def fake_tmux(*args: str, check: bool = True) -> str | None:
+            del check
+            if args[0] == "display-message":
+                return "work\t%7\t4322\t/dev/pts/7\t0\t\t1\tcodex\n"
+            if args[0] == "pipe-pane":
+                return ""
+            if args[0] == "send-keys":
+                return ""
+            return ""
+
+        monkeypatch.setattr("subprocess.check_output", lambda *args, **kwargs: "")
+        session._git_value = fake_git_value  # type: ignore[method-assign]
+        session._tmux = fake_tmux  # type: ignore[method-assign]
+
+        await session.start()
+        await session.apply_hook_event(
+            {
+                "hook_event_name": "Stop",
+                "state": "idle",
+                "status_detail": "Waiting for input",
+                "codex_session_id": "codex-session",
+                "tty": "/dev/pts/7",
+                "pid": 4322,
+            }
+        )
+        await session.emit_heartbeat()
+
+        heartbeat = next(event for event in reversed(events) if event.get("event_type") == "heartbeat")
+        assert session.state == "idle"
+        assert heartbeat["state"] == "idle"
+        assert heartbeat["meta"]["status_detail"] == "Waiting for input"
+        assert heartbeat["meta"]["codex_session_id"] == "codex-session"
+
+    asyncio.run(run_case())
+
+
 @pytest.mark.skipif(not tmux_is_usable(), reason="tmux is not usable in this test environment")
 def test_tmux_terminal_session_emits_output_and_stops(tmp_path: Path) -> None:
     async def run_case() -> None:
