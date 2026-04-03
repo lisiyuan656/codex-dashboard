@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from .config import Settings
 from .models import Agent, ApprovalRequest, Session as ManagedSession, SessionEvent, SessionLock, User, utcnow
 from .security import hash_password, verify_password
+from .terminal import sanitize_terminal_output
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -37,6 +38,14 @@ def _normalized_runtime_state(session: ManagedSession, payload_state: str | None
     ):
         return "running"
     return payload_state
+
+
+def _output_text_for(session: ManagedSession, payload: dict[str, Any]) -> str:
+    text = payload.get("text", "")
+    meta = session.meta or {}
+    if meta.get("transport") == "tmux_terminal":
+        return sanitize_terminal_output(text)
+    return text
 
 
 def ensure_default_admin(db: Session, settings: Settings) -> None:
@@ -273,7 +282,7 @@ def ingest_session_event(db: Session, agent_id: str, payload: dict[str, Any]) ->
         session.started_at = payload.get("started_at", session.started_at)
     elif event_type == "output":
         session.state = _normalized_runtime_state(session, payload.get("state")) or session.state or "running"
-        chunk = payload.get("text", "")
+        chunk = _output_text_for(session, payload)
         session.last_output_excerpt = ((session.last_output_excerpt or "") + chunk)[-4000:]
     elif event_type == "heartbeat":
         if session.state not in {"awaiting_approval", "stopped", "finished", "failed"}:

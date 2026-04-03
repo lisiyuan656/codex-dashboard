@@ -8,6 +8,8 @@ import shlex
 import subprocess
 from typing import Any, Protocol
 
+from ..terminal import sanitize_terminal_output
+
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -928,6 +930,7 @@ class TmuxTerminalSession(ManagedSessionBase):
             handle.seek(self._log_offset)
             chunk = handle.read()
             self._log_offset = handle.tell()
+        chunk = sanitize_terminal_output(chunk)
         if not chunk:
             return
         await self.emit(

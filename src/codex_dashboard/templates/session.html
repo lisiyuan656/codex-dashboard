@@ -109,10 +109,24 @@
   const lockButton = document.getElementById("lock-button");
   const inputBox = document.getElementById("input-box");
 
+  function sanitizeTerminalOutput(text) {
+    return text
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "")
+      .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
+      .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+      .replace(/\u001b[@-_]/g, "")
+      .replace(/[\u0000-\u0008\u000b-\u001a\u001c-\u001f\u007f]/g, "");
+  }
+
   function appendOutput(text) {
-    sessionOutput.textContent += text;
+    const cleaned = sanitizeTerminalOutput(text);
+    if (!cleaned) return;
+    sessionOutput.textContent += cleaned;
     sessionOutput.scrollTop = sessionOutput.scrollHeight;
   }
+
+  sessionOutput.textContent = sanitizeTerminalOutput(sessionOutput.textContent);
 
   function prependEvent(title, payload) {
     const card = document.createElement("div");

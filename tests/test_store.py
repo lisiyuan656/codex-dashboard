@@ -291,6 +291,56 @@ def test_ingest_session_event_preserves_running_for_current_pane_tmux_sessions()
     assert "hello" in (session.last_output_excerpt or "")
 
 
+def test_ingest_session_event_strips_tmux_escape_sequences_from_excerpt() -> None:
+    db = make_db()
+    now = utcnow()
+    agent = Agent(
+        id="agent-4b",
+        display_name="Agent Four B",
+        hostname="host",
+        status="online",
+        last_seen_at=now,
+        labels=[],
+        meta={},
+    )
+    session = ManagedSession(
+        id="session-4b",
+        agent_id="agent-4b",
+        source="managed",
+        name="Tmux Session",
+        state="running",
+        command="codex --no-alt-screen",
+        cwd=".",
+        pid=4321,
+        started_at=now - timedelta(minutes=1),
+        last_heartbeat_at=now,
+        meta={"transport": "tmux_terminal", "tmux_launch_mode": "current_pane"},
+    )
+    db.add(agent)
+    db.add(session)
+    db.commit()
+
+    ingest_session_event(
+        db,
+        "agent-4b",
+        {
+            "session_id": "session-4b",
+            "event_type": "output",
+            "state": "running",
+            "pid": 4321,
+            "text": "\u001b]10;?\u001b\\\u001b[1;2H\u001b[0mToken usage: total=12\r\nrun codex resume abc-123\u001b[39m",
+            "meta": {
+                "transport": "tmux_terminal",
+                "tmux_launch_mode": "current_pane",
+                "pane_current_command": "uv",
+            },
+        },
+    )
+
+    db.refresh(session)
+    assert session.last_output_excerpt == "Token usage: total=12\nrun codex resume abc-123"
+
+
 def test_get_recoverable_agent_sessions_returns_only_live_tmux_sessions() -> None:
     db = make_db()
     now = utcnow()
