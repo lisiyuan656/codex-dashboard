@@ -141,7 +141,7 @@ def test_refresh_staleness_stops_stale_detected_unmanaged_sessions() -> None:
     assert session.ended_at is not None
 
 
-def test_dashboard_lists_hide_ended_unmanaged_sessions() -> None:
+def test_dashboard_lists_hide_stopped_sessions() -> None:
     db = make_db()
     now = utcnow()
     agent = Agent(
@@ -212,7 +212,6 @@ def test_dashboard_lists_hide_ended_unmanaged_sessions() -> None:
     agent_sessions = get_agent_sessions(db, "agent-3")
     assert [session.id for session in agent_sessions] == [
         "managed-running",
-        "managed-stopped",
         "unmanaged-running",
     ]
 
@@ -220,7 +219,6 @@ def test_dashboard_lists_hide_ended_unmanaged_sessions() -> None:
     assert len(overview) == 1
     assert [session.id for session in overview[0]["sessions"]] == [
         "managed-running",
-        "managed-stopped",
         "unmanaged-running",
     ]
 

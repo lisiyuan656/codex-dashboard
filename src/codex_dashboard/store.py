@@ -23,7 +23,9 @@ def _as_utc(value: datetime | None) -> datetime | None:
 
 
 def _show_in_dashboard(session: ManagedSession) -> bool:
-    return not (session.source == "unmanaged" and session.state in {"finished", "failed", "stopped"})
+    if session.state == "stopped":
+        return False
+    return not (session.source == "unmanaged" and session.state in {"finished", "failed"})
 
 
 def _normalized_runtime_state(session: ManagedSession, payload_state: str | None) -> str | None:
