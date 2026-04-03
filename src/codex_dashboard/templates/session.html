@@ -207,8 +207,10 @@
   });
 
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-  const socket = new WebSocket(`${scheme}://${window.location.host}/ws/sessions/${sessionId}`);
-  socket.addEventListener("message", (event) => {
+  let reconnectTimer = null;
+  let reconnectDelayMs = 1000;
+
+  function handleSocketMessage(event) {
     const payload = JSON.parse(event.data);
     if (payload.type === "history_batch") {
       return;
@@ -226,6 +228,30 @@
     if (payload.type === "lock_changed") {
       lockState.textContent = payload.message;
     }
-  });
+  }
+
+  function connectSocket() {
+    const socket = new WebSocket(`${scheme}://${window.location.host}/ws/sessions/${sessionId}`);
+    socket.addEventListener("open", () => {
+      reconnectDelayMs = 1000;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    });
+    socket.addEventListener("message", handleSocketMessage);
+    socket.addEventListener("close", () => {
+      if (reconnectTimer) {
+        return;
+      }
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connectSocket();
+      }, reconnectDelayMs);
+      reconnectDelayMs = Math.min(reconnectDelayMs * 2, 10000);
+    });
+  }
+
+  connectSocket();
 </script>
 {% endblock %}

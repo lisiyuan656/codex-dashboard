@@ -179,6 +179,37 @@ def get_agent_sessions(db: Session, agent_id: str) -> list[ManagedSession]:
     ]
 
 
+def get_recoverable_agent_sessions(db: Session, agent_id: str) -> list[dict[str, Any]]:
+    recoverable = []
+    for session in db.scalars(
+        select(ManagedSession).where(ManagedSession.agent_id == agent_id).order_by(ManagedSession.started_at.desc())
+    ).all():
+        if session.source != "managed" or session.state in {"finished", "failed", "stopped"}:
+            continue
+        meta = session.meta or {}
+        if meta.get("transport") != "tmux_terminal":
+            continue
+        recoverable.append(
+            {
+                "session_id": session.id,
+                "name": session.name,
+                "cwd": session.cwd,
+                "argv": list(meta.get("argv", [])),
+                "initial_prompt": meta.get("initial_prompt", ""),
+                "tmux_pane": meta.get("tmux_pane"),
+                "tmux_session": meta.get("tmux_session"),
+                "tmux_launch_mode": meta.get("tmux_launch_mode", "detached_session"),
+                "repo_path": session.repo_path,
+                "git_branch": session.git_branch,
+                "pid": session.pid,
+                "pane_tty": meta.get("pane_tty"),
+                "attached_clients": meta.get("attached_clients", 0),
+                "pane_current_command": meta.get("pane_current_command"),
+            }
+        )
+    return recoverable
+
+
 def create_pending_session(
     db: Session,
     *,

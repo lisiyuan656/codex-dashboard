@@ -9,6 +9,7 @@ from codex_dashboard.security import hash_password
 from codex_dashboard.store import (
     acquire_lock,
     get_agent_sessions,
+    get_recoverable_agent_sessions,
     ingest_session_event,
     list_agents_with_sessions,
     refresh_staleness,
@@ -288,3 +289,86 @@ def test_ingest_session_event_preserves_running_for_current_pane_tmux_sessions()
     db.refresh(session)
     assert session.state == "running"
     assert "hello" in (session.last_output_excerpt or "")
+
+
+def test_get_recoverable_agent_sessions_returns_only_live_tmux_sessions() -> None:
+    db = make_db()
+    now = utcnow()
+    agent = Agent(
+        id="agent-5",
+        display_name="Agent Five",
+        hostname="host",
+        status="online",
+        last_seen_at=now,
+        labels=[],
+        meta={},
+    )
+    db.add(agent)
+    db.add_all(
+        [
+            ManagedSession(
+                id="recover-tmux",
+                agent_id="agent-5",
+                source="managed",
+                name="Recover Tmux",
+                state="running",
+                command="codex --no-alt-screen",
+                cwd="/repo",
+                pid=111,
+                started_at=now,
+                last_heartbeat_at=now,
+                meta={
+                    "transport": "tmux_terminal",
+                    "tmux_launch_mode": "current_pane",
+                    "tmux_pane": "%7",
+                    "tmux_session": "work",
+                    "argv": ["resume", "--last"],
+                },
+            ),
+            ManagedSession(
+                id="skip-app-server",
+                agent_id="agent-5",
+                source="managed",
+                name="App Server",
+                state="running",
+                command="codex app-server",
+                cwd="/repo",
+                started_at=now,
+                last_heartbeat_at=now,
+                meta={"transport": "app_server"},
+            ),
+            ManagedSession(
+                id="skip-stopped",
+                agent_id="agent-5",
+                source="managed",
+                name="Stopped Tmux",
+                state="stopped",
+                command="codex --no-alt-screen",
+                cwd="/repo",
+                started_at=now,
+                last_heartbeat_at=now,
+                meta={"transport": "tmux_terminal", "tmux_pane": "%8"},
+            ),
+        ]
+    )
+    db.commit()
+
+    recoverable = get_recoverable_agent_sessions(db, "agent-5")
+    assert recoverable == [
+        {
+            "session_id": "recover-tmux",
+            "name": "Recover Tmux",
+            "cwd": "/repo",
+            "argv": ["resume", "--last"],
+            "initial_prompt": "",
+            "tmux_pane": "%7",
+            "tmux_session": "work",
+            "tmux_launch_mode": "current_pane",
+            "repo_path": None,
+            "git_branch": None,
+            "pid": 111,
+            "pane_tty": None,
+            "attached_clients": 0,
+            "pane_current_command": None,
+        }
+    ]

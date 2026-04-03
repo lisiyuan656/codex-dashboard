@@ -23,6 +23,7 @@ from .store import (
     create_pending_session,
     ensure_default_admin,
     get_agent_detail,
+    get_recoverable_agent_sessions,
     get_agent_sessions,
     get_session_detail,
     ingest_session_event,
@@ -286,6 +287,9 @@ def create_app() -> FastAPI:
                             meta=payload.get("meta", {}),
                             token=None,
                         )
+                        recoverable_sessions = get_recoverable_agent_sessions(db, agent_id)
+                        if recoverable_sessions:
+                            await websocket.send_json({"type": "restore_sessions", "sessions": recoverable_sessions})
                     elif message_type == "heartbeat":
                         record_heartbeat(db, agent_id, payload.get("meta", {}))
                     elif message_type == "session_event":

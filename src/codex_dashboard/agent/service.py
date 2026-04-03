@@ -107,6 +107,9 @@ class DashboardAgent:
             except Exception:
                 return
             return
+        if action_type == "restore_sessions":
+            await self._restore_sessions(payload.get("sessions", []))
+            return
 
         session_id = payload.get("session_id")
         session = self.sessions.get(session_id)
@@ -206,6 +209,58 @@ class DashboardAgent:
                 }
             )
             raise
+
+    async def _restore_sessions(self, payloads: list[dict[str, Any]]) -> None:
+        for item in payloads:
+            session_id = item.get("session_id")
+            if not session_id:
+                continue
+            existing = self.sessions.get(session_id)
+            if existing is not None:
+                await existing.sync()
+                continue
+
+            session = TmuxTerminalSession(
+                session_id=session_id,
+                name=item.get("name", "Managed Codex Session"),
+                cwd=item.get("cwd", "."),
+                codex_bin=self.config.codex_bin,
+                tmux_bin=self.config.tmux_bin,
+                emit=self.emit,
+                spool_dir=self.config.spool_dir,
+                argv=[str(value) for value in item.get("argv", [])],
+                initial_prompt=item.get("initial_prompt", ""),
+                existing_pane_id=item.get("tmux_pane"),
+            )
+            self.sessions[session_id] = session
+            try:
+                await session.restore(
+                    session_name=item.get("tmux_session"),
+                    launch_mode=item.get("tmux_launch_mode", "detached_session"),
+                    repo_path=item.get("repo_path"),
+                    git_branch=item.get("git_branch"),
+                    pid=item.get("pid"),
+                    pane_tty=item.get("pane_tty"),
+                    attached_clients=int(item.get("attached_clients") or 0),
+                    pane_current_command=item.get("pane_current_command"),
+                )
+                await session.sync()
+                if not session.is_alive:
+                    self.sessions.pop(session_id, None)
+            except Exception as exc:
+                self.sessions.pop(session_id, None)
+                await self.emit(
+                    {
+                        "type": "session_event",
+                        "event_type": "output",
+                        "session_id": session_id,
+                        "text": f"[agent restore error] {exc}\n",
+                        "state": "failed",
+                        "meta": {
+                            "transport": "tmux_terminal",
+                        },
+                    }
+                )
 
     async def _start_local_socket_server(self) -> None:
         if self._socket_server is not None:

@@ -806,6 +806,35 @@ class TmuxTerminalSession(ManagedSessionBase):
         if not self._observed_foreground_codex or (self._pane_current_command not in self._expected_commands):
             await self._finalize("stopped", 130)
 
+    async def restore(
+        self,
+        *,
+        session_name: str | None,
+        launch_mode: str,
+        repo_path: str | None,
+        git_branch: str | None,
+        pid: int | None,
+        pane_tty: str | None,
+        attached_clients: int,
+        pane_current_command: str | None,
+    ) -> None:
+        self.session_name = session_name
+        self.repo_path = repo_path
+        self.git_branch = git_branch
+        self._pid = pid
+        self.pane_tty = pane_tty
+        self.attached_clients = attached_clients
+        self._pane_current_command = pane_current_command
+        self._owns_session = launch_mode != "current_pane"
+        self._pipe_started = True
+        if self.log_path.exists():
+            self._log_offset = self.log_path.stat().st_size
+        await self._refresh_tmux_state()
+        if self._final_event_sent:
+            return
+        if self._log_task is None or self._log_task.done():
+            self._log_task = asyncio.create_task(self._log_loop())
+
     async def send_input(self, text: str) -> None:
         if self.pane_id is None:
             raise TmuxSessionError("Terminal session is not initialized")
