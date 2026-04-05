@@ -146,6 +146,13 @@ mkdir -p docker/data
 $EDITOR docker/server.env
 ```
 
+If `docker compose` later fails with `sqlite3.OperationalError: unable to open database file`, set `CODEX_DASHBOARD_UID` and `CODEX_DASHBOARD_GID` in `docker/server.env` to the owner of your host data directory, usually:
+
+```bash
+id -u
+id -g
+```
+
 2. Build and start the container:
 
 ```bash

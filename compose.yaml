@@ -6,6 +6,7 @@ services:
     image: codex-dashboard-server:latest
     container_name: codex-dashboard-server
     restart: unless-stopped
+    user: "${CODEX_DASHBOARD_UID:-1000}:${CODEX_DASHBOARD_GID:-1000}"
     ports:
       - "${CODEX_DASHBOARD_SERVER_PORT:-8000}:8000"
     environment:
