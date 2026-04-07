@@ -15,6 +15,7 @@ import websockets
 
 from .config import AgentConfig
 from .session import AppServerSession, CliHookSession, SessionRuntime, TmuxTerminalSession
+from .transcript import CodexRolloutTranscriptReader, RolloutFollowState
 
 
 class DashboardAgent:
@@ -24,6 +25,9 @@ class DashboardAgent:
         self.sessions: dict[str, SessionRuntime] = {}
         self.ws: websockets.ClientConnection | None = None
         self._socket_server: asyncio.AbstractServer | None = None
+        self._transcript_reader = CodexRolloutTranscriptReader()
+        self._transcript_tasks: dict[str, asyncio.Task[None]] = {}
+        self._transcript_task_ids: dict[str, str] = {}
 
     async def emit(self, payload: dict[str, Any]) -> None:
         if self.ws is None:
@@ -63,6 +67,7 @@ class DashboardAgent:
                 }
             )
             await self._sync_sessions()
+            await self._sync_transcript_tracking()
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             watch_task = asyncio.create_task(self._watch_loop())
             try:
@@ -72,6 +77,7 @@ class DashboardAgent:
             finally:
                 heartbeat_task.cancel()
                 watch_task.cancel()
+                await self._cancel_transcript_tasks()
                 self.ws = None
 
     async def _heartbeat_loop(self) -> None:
@@ -112,6 +118,12 @@ class DashboardAgent:
             return
         if action_type == "restore_sessions":
             await self._restore_sessions(payload.get("sessions", []))
+            return
+        if action_type == "hydrate_transcript":
+            await self._hydrate_transcript(
+                session_id=str(payload.get("session_id") or ""),
+                codex_session_id=str(payload.get("codex_session_id") or ""),
+            )
             return
 
         session_id = payload.get("session_id")
@@ -221,6 +233,7 @@ class DashboardAgent:
             existing = self.sessions.get(session_id)
             if existing is not None:
                 await existing.sync()
+                await self._maybe_track_session_transcript(session_id, existing)
                 continue
 
             session = TmuxTerminalSession(
@@ -252,6 +265,7 @@ class DashboardAgent:
                     last_hook_event=item.get("last_hook_event"),
                 )
                 await session.sync()
+                await self._maybe_track_session_transcript(session_id, session)
                 if not session.is_alive:
                     self.sessions.pop(session_id, None)
             except Exception as exc:
@@ -383,6 +397,7 @@ class DashboardAgent:
             session = self.sessions.get(dashboard_session_id)
             if isinstance(session, TmuxTerminalSession):
                 await session.apply_hook_event(payload)
+                await self._maybe_track_session_transcript(session.session_id, session)
                 return {"ok": True, "session": self._session_snapshot(session)}
             return {"ok": True, "ignored": True}
 
@@ -410,6 +425,7 @@ class DashboardAgent:
             self.sessions[session_id] = session
 
         await session.apply_hook_event(payload)
+        await self._maybe_track_session_transcript(session.session_id, session)
         return {"ok": True, "session": self._session_snapshot(session)}
 
     def _machine_meta(self) -> dict[str, Any]:
@@ -438,6 +454,7 @@ class DashboardAgent:
             if (session.pid is not None and session.pid in live_pids) or session.discovery_ttys().intersection(live_ttys):
                 continue
             await session.report_completion(None)
+            await self._cancel_transcript_task(session_id)
             self.sessions.pop(session_id, None)
 
     def _codex_processes(self) -> list[dict[str, Any]] | None:
@@ -499,3 +516,131 @@ class DashboardAgent:
                 }
             )
         return discovered
+
+    async def _sync_transcript_tracking(self) -> None:
+        for session_id, session in list(self.sessions.items()):
+            await self._maybe_track_session_transcript(session_id, session)
+
+    async def _maybe_track_session_transcript(self, session_id: str, session: SessionRuntime) -> None:
+        codex_session_id = self._codex_session_id_for(session)
+        if not codex_session_id:
+            return
+        if session.transport not in {"tmux_terminal", "cli_terminal"}:
+            return
+        existing = self._transcript_tasks.get(session_id)
+        if existing is not None and not existing.done() and self._transcript_task_ids.get(session_id) == codex_session_id:
+            return
+        await self._cancel_transcript_task(session_id)
+        task = asyncio.create_task(self._follow_transcript(session_id, codex_session_id))
+        self._transcript_tasks[session_id] = task
+        self._transcript_task_ids[session_id] = codex_session_id
+
+    def _codex_session_id_for(self, session: SessionRuntime) -> str | None:
+        value = getattr(session, "codex_session_id", None)
+        if not value:
+            value = getattr(session, "_codex_session_id", None)
+        if isinstance(value, str) and value.strip():
+            return value
+        return None
+
+    async def _emit_transcript(
+        self,
+        *,
+        session_id: str,
+        items: list[dict[str, Any]],
+        complete: bool,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "type": "session_transcript",
+            "session_id": session_id,
+            "items": items,
+            "complete": complete,
+            "status": status,
+        }
+        if error:
+            payload["error"] = error
+        await self.emit(payload)
+
+    async def _hydrate_transcript(self, *, session_id: str, codex_session_id: str) -> None:
+        if not session_id or not codex_session_id:
+            return
+        result = await asyncio.to_thread(
+            self._transcript_reader.read_update,
+            RolloutFollowState(codex_session_id=codex_session_id),
+            restart=True,
+        )
+        await self._emit_transcript(
+            session_id=session_id,
+            items=[item.__dict__ for item in result.items],
+            complete=True,
+            status="error" if result.error else "ready",
+            error=result.error,
+        )
+
+    async def _follow_transcript(self, session_id: str, codex_session_id: str) -> None:
+        state = RolloutFollowState(codex_session_id=codex_session_id)
+        try:
+            while True:
+                session = self.sessions.get(session_id)
+                active = (
+                    session is not None
+                    and session.is_alive
+                    and self._codex_session_id_for(session) == codex_session_id
+                )
+                result = await asyncio.to_thread(self._transcript_reader.read_update, state)
+                state = result.state
+                if result.error:
+                    if not active:
+                        await self._emit_transcript(
+                            session_id=session_id,
+                            items=[],
+                            complete=True,
+                            status="error",
+                            error=result.error,
+                        )
+                        return
+                    await asyncio.sleep(1.0)
+                    continue
+
+                if result.items:
+                    await self._emit_transcript(
+                        session_id=session_id,
+                        items=[item.__dict__ for item in result.items],
+                        complete=not active,
+                        status="ready",
+                    )
+                elif not active:
+                    await self._emit_transcript(
+                        session_id=session_id,
+                        items=[],
+                        complete=True,
+                        status="ready",
+                    )
+
+                if not active:
+                    return
+                await asyncio.sleep(0.75)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            current = self._transcript_tasks.get(session_id)
+            if current is asyncio.current_task():
+                self._transcript_tasks.pop(session_id, None)
+                self._transcript_task_ids.pop(session_id, None)
+
+    async def _cancel_transcript_task(self, session_id: str) -> None:
+        task = self._transcript_tasks.pop(session_id, None)
+        self._transcript_task_ids.pop(session_id, None)
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _cancel_transcript_tasks(self) -> None:
+        for session_id in list(self._transcript_tasks):
+            await self._cancel_transcript_task(session_id)

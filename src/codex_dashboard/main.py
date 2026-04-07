@@ -27,6 +27,7 @@ from .store import (
     get_agent_sessions,
     get_session_detail,
     ingest_session_event,
+    ingest_session_transcript,
     list_agents_with_sessions,
     mark_agent_offline,
     record_heartbeat,
@@ -34,6 +35,7 @@ from .store import (
     release_lock,
     resolve_latest_pending_approval,
     session_summary,
+    session_transcript_item_summary,
     upsert_agent,
     verify_agent_token,
 )
@@ -70,6 +72,52 @@ def _session_status_detail(session: Any) -> str | None:
     if transport in {"tmux_terminal", "cli_terminal"} and session.state == "idle":
         return "Waiting for input"
     return None
+
+
+def _transcript_view_state(
+    session: Any,
+    transcript_items: list[dict[str, Any]],
+    *,
+    agent_connected: bool,
+) -> dict[str, Any]:
+    meta = session.meta or {}
+    codex_session_id = meta.get("codex_session_id")
+    transcript_status = meta.get("transcript_status")
+    transcript_error = meta.get("transcript_error")
+    if transcript_items:
+        return {
+            "status": "ready",
+            "label": "ready",
+            "message": "",
+            "can_refresh": bool(codex_session_id and agent_connected),
+        }
+    if not codex_session_id:
+        return {
+            "status": "unavailable",
+            "label": "unavailable",
+            "message": "Transcript unavailable because this session has no recorded Codex session id.",
+            "can_refresh": False,
+        }
+    if transcript_status == "error" and transcript_error:
+        return {
+            "status": "error",
+            "label": "error",
+            "message": transcript_error,
+            "can_refresh": agent_connected,
+        }
+    if not agent_connected:
+        return {
+            "status": "offline",
+            "label": "agent offline",
+            "message": "Transcript is not loaded yet. Reconnect the owning agent and refresh to hydrate it from the local Codex archive.",
+            "can_refresh": False,
+        }
+    return {
+        "status": transcript_status or "pending",
+        "label": "pending",
+        "message": "Transcript has not been loaded yet. Refresh to hydrate chat and activity from the local Codex archive.",
+        "can_refresh": True,
+    }
 
 
 templates.env.globals["display_session_state"] = _display_session_state
@@ -158,11 +206,20 @@ def create_app() -> FastAPI:
         detail = get_session_detail(db, session_id)
         if detail is None:
             raise HTTPException(status_code=404, detail="Session not found")
+        transcript_items = [session_transcript_item_summary(item) for item in detail["transcript_items"]]
+        agent_connected = hub.is_agent_connected(detail["session"].agent_id)
         return templates.TemplateResponse(
             request,
             "session.html",
             {
                 "detail": detail,
+                "transcript_items": transcript_items,
+                "transcript_state": _transcript_view_state(
+                    detail["session"],
+                    transcript_items,
+                    agent_connected=agent_connected,
+                ),
+                "agent_connected": agent_connected,
                 "user": user,
             },
         )
@@ -277,6 +334,33 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return JSONResponse({"ok": True})
 
+    @app.post("/api/sessions/{session_id}/transcript/refresh")
+    async def refresh_session_transcript(
+        session_id: str,
+        db: Session = Depends(get_db),
+        user=Depends(require_user),
+    ) -> JSONResponse:
+        del user
+        detail = get_session_detail(db, session_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        session = detail["session"]
+        codex_session_id = (session.meta or {}).get("codex_session_id")
+        if not codex_session_id:
+            raise HTTPException(status_code=409, detail="Session does not have a Codex session id")
+        try:
+            await hub.send_action(
+                session.agent_id,
+                {
+                    "type": "hydrate_transcript",
+                    "session_id": session_id,
+                    "codex_session_id": codex_session_id,
+                },
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return JSONResponse({"ok": True})
+
     @app.websocket("/ws/agent")
     async def agent_socket(websocket: WebSocket) -> None:
         await websocket.accept()
@@ -322,6 +406,21 @@ def create_app() -> FastAPI:
                                     "session_id": session.id,
                                     "event_type": payload["event_type"],
                                     "payload": payload,
+                                    "summary": session_summary(session),
+                                },
+                            )
+                    elif message_type == "session_transcript":
+                        session = ingest_session_transcript(db, agent_id, payload)
+                        if session is not None:
+                            await hub.broadcast_session(
+                                session.id,
+                                {
+                                    "type": "session_transcript",
+                                    "session_id": session.id,
+                                    "items": payload.get("items", []),
+                                    "complete": payload.get("complete", False),
+                                    "status": payload.get("status"),
+                                    "error": payload.get("error"),
                                     "summary": session_summary(session),
                                 },
                             )

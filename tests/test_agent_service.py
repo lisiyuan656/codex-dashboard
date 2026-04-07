@@ -3,6 +3,7 @@ import asyncio
 from codex_dashboard.agent.config import AgentConfig
 from codex_dashboard.agent.service import DashboardAgent
 from codex_dashboard.agent.session import CliHookSession
+from codex_dashboard.agent.transcript import RolloutFollowState, RolloutReadResult, TranscriptItem
 
 
 class FakeSession:
@@ -385,3 +386,74 @@ def test_reconcile_hook_sessions_stops_missing_cli_sessions() -> None:
 
     assert agent.sessions == {}
     assert events[-1]["event_type"] == "stopped"
+
+
+def test_hydrate_transcript_action_emits_transcript_payload() -> None:
+    events: list[dict[str, object]] = []
+
+    async def fake_emit(payload: dict[str, object]) -> None:
+        events.append(payload)
+
+    config = AgentConfig(
+        ws_url="ws://127.0.0.1:8000/ws/agent",
+        agent_id="agent-1",
+        token="token",
+        display_name="Agent",
+        labels=[],
+        heartbeat_seconds=15,
+        watch_seconds=15,
+        codex_bin="codex",
+        tmux_bin="tmux",
+        socket_path="/tmp/codex-dashboard-agent.sock",
+        spool_dir="/tmp/codex-dashboard-agent",
+    )
+    agent = DashboardAgent(config)
+    agent.emit = fake_emit  # type: ignore[method-assign]
+
+    def fake_read_update(state: RolloutFollowState, *, restart: bool = False) -> RolloutReadResult:
+        assert restart is True
+        assert state.codex_session_id == "codex-session"
+        return RolloutReadResult(
+            items=[
+                TranscriptItem(
+                    source_key="0000000001:0000",
+                    kind="user_message",
+                    role="user",
+                    text="Show the transcript",
+                    meta={},
+                    created_at="2026-04-07T00:00:00+00:00",
+                )
+            ],
+            state=state,
+        )
+
+    agent._transcript_reader.read_update = fake_read_update  # type: ignore[method-assign]
+
+    asyncio.run(
+        agent._handle_action(
+            {
+                "type": "hydrate_transcript",
+                "session_id": "session-1",
+                "codex_session_id": "codex-session",
+            }
+        )
+    )
+
+    assert events == [
+        {
+            "type": "session_transcript",
+            "session_id": "session-1",
+            "items": [
+                {
+                    "source_key": "0000000001:0000",
+                    "kind": "user_message",
+                    "role": "user",
+                    "text": "Show the transcript",
+                    "meta": {},
+                    "created_at": "2026-04-07T00:00:00+00:00",
+                }
+            ],
+            "complete": True,
+            "status": "ready",
+        }
+    ]

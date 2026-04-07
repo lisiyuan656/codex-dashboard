@@ -69,7 +69,23 @@
     <button type="button" id="send-button" {% if session.source != "managed" %}disabled{% endif %}>Send</button>
   </div>
 
-  <pre id="session-output" class="session-output">{{ session.last_output_excerpt or "" }}</pre>
+  <div class="toolbar tab-strip">
+    <button type="button" class="secondary tab-button active" data-panel="output-panel">Output</button>
+    <button type="button" class="secondary tab-button" data-panel="transcript-panel">Transcript</button>
+    <span class="pill" id="transcript-status">{{ transcript_state.label }}</span>
+    {% if transcript_state.can_refresh %}
+    <button type="button" id="refresh-transcript-button" class="secondary">Refresh Transcript</button>
+    {% endif %}
+  </div>
+
+  <section id="output-panel" class="tab-panel">
+    <pre id="session-output" class="session-output">{{ session.last_output_excerpt or "" }}</pre>
+  </section>
+
+  <section id="transcript-panel" class="tab-panel" hidden>
+    <p class="meta" id="transcript-empty"{% if transcript_items %} hidden{% endif %}>{{ transcript_state.message }}</p>
+    <div id="transcript-list" class="transcript-list"></div>
+  </section>
 </div>
 
 {% if transport == "app_server" %}
@@ -108,6 +124,7 @@
 
 <script>
   const sessionId = "{{ session.id }}";
+  const sessionName = {{ session.name | tojson }};
   const sessionOutput = document.getElementById("session-output");
   const eventList = document.getElementById("event-list");
   const lockState = document.getElementById("lock-state");
@@ -116,6 +133,13 @@
   const stateBadge = document.getElementById("state-badge");
   const statusDetail = document.getElementById("status-detail");
   const transport = "{{ transport }}";
+  const transcriptList = document.getElementById("transcript-list");
+  const transcriptEmpty = document.getElementById("transcript-empty");
+  const transcriptStatus = document.getElementById("transcript-status");
+  const refreshTranscriptButton = document.getElementById("refresh-transcript-button");
+  const initialTranscriptItems = {{ transcript_items | tojson }};
+  const initialTranscriptState = {{ transcript_state | tojson }};
+  const seenTranscriptKeys = new Set();
 
   function sanitizeTerminalOutput(text) {
     return text
@@ -125,6 +149,15 @@
       .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
       .replace(/\u001b[@-_]/g, "")
       .replace(/[\u0000-\u0008\u000b-\u001a\u001c-\u001f\u007f]/g, "");
+  }
+
+  function escapeHtml(text) {
+    return String(text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   function appendOutput(text) {
@@ -141,10 +174,10 @@
     card.className = "card";
     card.innerHTML = `
       <div class="toolbar">
-        <strong>${title}</strong>
+        <strong>${escapeHtml(title)}</strong>
         <span class="pill">${new Date().toISOString()}</span>
       </div>
-      <pre class="session-output" style="min-height: 80px;">${JSON.stringify(payload, null, 2)}</pre>
+      <pre class="session-output" style="min-height: 80px;">${escapeHtml(JSON.stringify(payload, null, 2))}</pre>
     `;
     eventList.prepend(card);
   }
@@ -176,6 +209,121 @@
     statusDetail.textContent = "";
   }
 
+  function transcriptLabel(kind) {
+    switch (kind) {
+      case "user_message":
+        return "User";
+      case "assistant_message":
+        return "Codex";
+      case "commentary":
+        return "Progress";
+      case "reasoning_summary":
+        return "Reasoning";
+      case "tool_activity":
+        return "Activity";
+      case "task_status":
+        return "Status";
+      default:
+        return "Transcript";
+    }
+  }
+
+  function transcriptDetailText(item) {
+    if (item.kind !== "tool_activity") {
+      return "";
+    }
+    const meta = item.meta || {};
+    if (typeof meta.details_text === "string" && meta.details_text.trim()) {
+      return meta.details_text;
+    }
+    const reduced = { ...meta };
+    delete reduced.details_text;
+    if (Object.keys(reduced).length === 0) {
+      return "";
+    }
+    return JSON.stringify(reduced, null, 2);
+  }
+
+  function createTranscriptItem(item) {
+    const article = document.createElement("article");
+    article.className = `transcript-item transcript-${item.kind}`;
+    const detailText = transcriptDetailText(item);
+    article.innerHTML = `
+      <div class="toolbar transcript-item-header">
+        <strong>${escapeHtml(transcriptLabel(item.kind))}</strong>
+        <span class="pill">${escapeHtml(item.created_at || "")}</span>
+      </div>
+      <pre class="transcript-body">${escapeHtml(item.text || "")}</pre>
+      ${detailText ? `<details class="transcript-details"><summary>Details</summary><pre class="session-output" style="min-height: 0;">${escapeHtml(detailText)}</pre></details>` : ""}
+    `;
+    return article;
+  }
+
+  function updateTranscriptState({ status, label, message }) {
+    transcriptStatus.textContent = label || status || "pending";
+    if (transcriptList.children.length > 0) {
+      transcriptEmpty.hidden = true;
+      transcriptEmpty.textContent = "";
+      return;
+    }
+    transcriptEmpty.hidden = !message;
+    transcriptEmpty.textContent = message || "";
+  }
+
+  function appendTranscriptItems(items) {
+    let appended = false;
+    for (const item of items || []) {
+      if (!item || !item.source_key || seenTranscriptKeys.has(item.source_key)) {
+        continue;
+      }
+      seenTranscriptKeys.add(item.source_key);
+      transcriptList.appendChild(createTranscriptItem(item));
+      appended = true;
+    }
+    if (appended) {
+      transcriptEmpty.hidden = true;
+      transcriptEmpty.textContent = "";
+      transcriptList.scrollTop = transcriptList.scrollHeight;
+    }
+  }
+
+  function applyTranscriptPayload(payload) {
+    appendTranscriptItems(payload.items || []);
+    if (payload.error) {
+      updateTranscriptState({ status: "error", label: "error", message: payload.error });
+      return;
+    }
+    if (transcriptList.children.length > 0) {
+      updateTranscriptState({ status: payload.status || "ready", label: "ready", message: "" });
+      return;
+    }
+    if (payload.complete) {
+      updateTranscriptState({
+        status: payload.status || "ready",
+        label: "ready",
+        message: "Transcript loaded, but no readable Codex chat or activity items were found.",
+      });
+      return;
+    }
+    updateTranscriptState({ status: payload.status || "pending", label: "syncing", message: transcriptEmpty.textContent });
+  }
+
+  function activatePanel(panelId) {
+    document.querySelectorAll(".tab-panel").forEach((panel) => {
+      panel.hidden = panel.id !== panelId;
+    });
+    document.querySelectorAll(".tab-button").forEach((button) => {
+      button.classList.toggle("active", button.dataset.panel === panelId);
+    });
+  }
+
+  document.querySelectorAll(".tab-button").forEach((button) => {
+    button.addEventListener("click", () => activatePanel(button.dataset.panel));
+  });
+
+  appendTranscriptItems(initialTranscriptItems);
+  updateTranscriptState(initialTranscriptState);
+
   async function postJson(url, payload) {
     const response = await fetch(url, {
       method: "POST",
@@ -188,6 +336,34 @@
     }
     return data;
   }
+
+  async function refreshTranscript({ showErrors = true } = {}) {
+    if (!refreshTranscriptButton) return;
+    refreshTranscriptButton.disabled = true;
+    try {
+      await postJson(`/api/sessions/${sessionId}/transcript/refresh`, {});
+      if (transcriptList.children.length === 0) {
+        updateTranscriptState({
+          status: "pending",
+          label: "syncing",
+          message: "Hydrating transcript from the agent's local Codex archive…",
+        });
+      }
+    } catch (error) {
+      if (showErrors) {
+        alert(error.message);
+      }
+      if (transcriptList.children.length === 0) {
+        updateTranscriptState({ status: "error", label: "error", message: error.message });
+      }
+    } finally {
+      refreshTranscriptButton.disabled = false;
+    }
+  }
+
+  refreshTranscriptButton?.addEventListener("click", async () => {
+    await refreshTranscript({ showErrors: true });
+  });
 
   lockButton.addEventListener("click", async () => {
     const action = lockButton.textContent.includes("Release") ? "release" : "acquire";
@@ -272,8 +448,16 @@
       }
       if (payload.summary) {
         updateSummary(payload.summary);
-        document.title = `${displayState(payload.summary)} • {{ session.name }}`;
+        document.title = `${displayState(payload.summary)} • ${sessionName}`;
       }
+      return;
+    }
+    if (payload.type === "session_transcript") {
+      applyTranscriptPayload(payload);
+      if (payload.summary) {
+        updateSummary(payload.summary);
+      }
+      return;
     }
     if (payload.type === "lock_changed") {
       lockState.textContent = payload.message;
@@ -303,5 +487,9 @@
   }
 
   connectSocket();
+
+  if (initialTranscriptItems.length === 0 && initialTranscriptState.can_refresh) {
+    refreshTranscript({ showErrors: false });
+  }
 </script>
 {% endblock %}

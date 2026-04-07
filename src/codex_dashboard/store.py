@@ -9,7 +9,16 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import Settings
-from .models import Agent, ApprovalRequest, Session as ManagedSession, SessionEvent, SessionLock, User, utcnow
+from .models import (
+    Agent,
+    ApprovalRequest,
+    Session as ManagedSession,
+    SessionEvent,
+    SessionLock,
+    SessionTranscriptItem,
+    User,
+    utcnow,
+)
 from .security import hash_password, verify_password
 from .terminal import sanitize_terminal_output
 
@@ -20,6 +29,19 @@ def _as_utc(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _parse_datetime(value: str | None) -> datetime:
+    if not value:
+        return utcnow()
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return utcnow()
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _show_in_dashboard(session: ManagedSession) -> bool:
@@ -332,6 +354,57 @@ def ingest_session_event(db: Session, agent_id: str, payload: dict[str, Any]) ->
     return session
 
 
+def ingest_session_transcript(db: Session, agent_id: str, payload: dict[str, Any]) -> ManagedSession | None:
+    session_id = payload["session_id"]
+    session = db.get(ManagedSession, session_id)
+    if session is None:
+        return None
+
+    session.agent_id = agent_id
+    session.last_heartbeat_at = utcnow()
+    meta = dict(session.meta or {})
+    meta["transcript_source"] = "codex_archive"
+    meta["transcript_complete"] = bool(payload.get("complete"))
+    meta["transcript_status"] = payload.get("status") or ("ready" if payload.get("items") or payload.get("complete") else "pending")
+    meta["transcript_error"] = payload.get("error")
+    meta["transcript_last_loaded_at"] = utcnow().isoformat()
+    session.meta = meta
+
+    items_payload = payload.get("items") or []
+    source_keys = [str(item.get("source_key")) for item in items_payload if item.get("source_key")]
+    existing_source_keys: set[str] = set()
+    if source_keys:
+        existing_source_keys = set(
+            db.scalars(
+                select(SessionTranscriptItem.source_key).where(
+                    SessionTranscriptItem.session_id == session_id,
+                    SessionTranscriptItem.source_key.in_(source_keys),
+                )
+            ).all()
+        )
+
+    for item in items_payload:
+        source_key = str(item.get("source_key") or "").strip()
+        if not source_key or source_key in existing_source_keys:
+            continue
+        db.add(
+            SessionTranscriptItem(
+                session_id=session_id,
+                source_key=source_key,
+                kind=str(item.get("kind") or "commentary"),
+                role=str(item["role"]) if item.get("role") is not None else None,
+                text=str(item.get("text") or ""),
+                meta=item.get("meta") or {},
+                created_at=_parse_datetime(item.get("created_at")),
+            )
+        )
+        existing_source_keys.add(source_key)
+
+    db.commit()
+    db.refresh(session)
+    return session
+
+
 def session_summary(session: ManagedSession) -> dict[str, Any]:
     return {
         "id": session.id,
@@ -353,6 +426,17 @@ def session_summary(session: ManagedSession) -> dict[str, Any]:
     }
 
 
+def session_transcript_item_summary(item: SessionTranscriptItem) -> dict[str, Any]:
+    return {
+        "source_key": item.source_key,
+        "kind": item.kind,
+        "role": item.role,
+        "text": item.text,
+        "meta": item.meta or {},
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+    }
+
+
 def get_session_detail(db: Session, session_id: str) -> dict[str, Any] | None:
     session = db.get(ManagedSession, session_id)
     if session is None:
@@ -364,11 +448,17 @@ def get_session_detail(db: Session, session_id: str) -> dict[str, Any] | None:
     approvals = db.scalars(
         select(ApprovalRequest).where(ApprovalRequest.session_id == session_id).order_by(ApprovalRequest.created_at.desc())
     ).all()
+    transcript_items = db.scalars(
+        select(SessionTranscriptItem)
+        .where(SessionTranscriptItem.session_id == session_id)
+        .order_by(SessionTranscriptItem.created_at.asc(), SessionTranscriptItem.source_key.asc(), SessionTranscriptItem.id.asc())
+    ).all()
     lock = db.get(SessionLock, session_id)
     return {
         "session": session,
         "events": events,
         "approvals": approvals,
+        "transcript_items": transcript_items,
         "lock": lock,
     }
 

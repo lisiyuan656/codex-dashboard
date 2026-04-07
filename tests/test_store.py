@@ -1,16 +1,18 @@
 from datetime import datetime, timedelta
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session as OrmSession
 
 from codex_dashboard.config import Settings
-from codex_dashboard.models import Agent, Base, Session as ManagedSession, SessionLock, User, utcnow
+from codex_dashboard.models import Agent, Base, Session as ManagedSession, SessionLock, SessionTranscriptItem, User, utcnow
 from codex_dashboard.security import hash_password
 from codex_dashboard.store import (
     acquire_lock,
     get_agent_sessions,
+    get_session_detail,
     get_recoverable_agent_sessions,
     ingest_session_event,
+    ingest_session_transcript,
     list_agents_with_sessions,
     refresh_staleness,
     release_lock,
@@ -481,3 +483,62 @@ def test_ingest_hook_status_updates_unmanaged_cli_session_state() -> None:
     assert session.state == "idle"
     assert session.meta["codex_session_id"] == "codex-session"
     assert session.meta["status_detail"] == "Waiting for input"
+
+
+def test_ingest_session_transcript_is_idempotent() -> None:
+    db = make_db()
+    now = utcnow()
+    agent = Agent(
+        id="agent-7",
+        display_name="Agent Seven",
+        hostname="host",
+        status="online",
+        last_seen_at=now,
+        labels=[],
+        meta={},
+    )
+    session = ManagedSession(
+        id="session-7",
+        agent_id="agent-7",
+        source="managed",
+        name="Transcript Session",
+        state="idle",
+        command="codex --no-alt-screen",
+        cwd="/repo",
+        started_at=now,
+        last_heartbeat_at=now,
+        meta={"transport": "tmux_terminal", "codex_session_id": "codex-session"},
+    )
+    db.add(agent)
+    db.add(session)
+    db.commit()
+
+    payload = {
+        "session_id": "session-7",
+        "items": [
+            {
+                "source_key": "0000000001:0000",
+                "kind": "user_message",
+                "role": "user",
+                "text": "Inspect the transcript",
+                "meta": {},
+                "created_at": "2026-04-07T00:00:00+00:00",
+            }
+        ],
+        "status": "ready",
+        "complete": True,
+    }
+
+    ingest_session_transcript(db, "agent-7", payload)
+    ingest_session_transcript(db, "agent-7", payload)
+
+    db.refresh(session)
+    detail = get_session_detail(db, "session-7")
+    items = db.scalars(select(SessionTranscriptItem).where(SessionTranscriptItem.session_id == "session-7")).all()
+
+    assert detail is not None
+    assert len(detail["transcript_items"]) == 1
+    assert len(items) == 1
+    assert items[0].text == "Inspect the transcript"
+    assert session.meta["transcript_status"] == "ready"
+    assert session.meta["transcript_complete"] is True
