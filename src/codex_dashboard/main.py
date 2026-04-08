@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-import json
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -15,7 +14,7 @@ import uvicorn
 from .config import get_settings
 from .db import SessionLocal, engine, get_db
 from .hub import ConnectionHub
-from .models import Base
+from .models import Base, utcnow
 from .security import get_websocket_user, require_user
 from .store import (
     acquire_lock,
@@ -36,6 +35,7 @@ from .store import (
     resolve_latest_pending_approval,
     session_summary,
     session_transcript_item_summary,
+    timeline_item_for_event,
     upsert_agent,
     verify_agent_token,
 )
@@ -213,6 +213,7 @@ def create_app() -> FastAPI:
             "session.html",
             {
                 "detail": detail,
+                "timeline_items": detail["timeline_items"],
                 "transcript_items": transcript_items,
                 "transcript_state": _transcript_view_state(
                     detail["session"],
@@ -399,6 +400,7 @@ def create_app() -> FastAPI:
                     elif message_type == "session_event":
                         session = ingest_session_event(db, agent_id, payload)
                         if session is not None:
+                            timeline_item = timeline_item_for_event(payload["event_type"], payload, utcnow())
                             await hub.broadcast_session(
                                 session.id,
                                 {
@@ -406,6 +408,7 @@ def create_app() -> FastAPI:
                                     "session_id": session.id,
                                     "event_type": payload["event_type"],
                                     "payload": payload,
+                                    "timeline_item": timeline_item,
                                     "summary": session_summary(session),
                                 },
                             )
@@ -443,16 +446,7 @@ def create_app() -> FastAPI:
             if detail is None:
                 await websocket.close(code=1008)
                 return
-            initial_events = [
-                {
-                    "type": "history",
-                    "session_id": session_id,
-                    "event_type": event.event_type,
-                    "payload": event.payload,
-                    "created_at": event.created_at.isoformat(),
-                }
-                for event in detail["events"][-100:]
-            ]
+            initial_events = detail["timeline_items"]
 
         await websocket.accept()
         await hub.register_viewer(session_id, websocket)

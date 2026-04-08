@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
+import json
 import uuid
 
 from sqlalchemy import select
@@ -21,6 +22,10 @@ from .models import (
 )
 from .security import hash_password, verify_password
 from .terminal import sanitize_terminal_output
+
+
+TIMELINE_RAW_EVENT_LIMIT = 200
+TIMELINE_ITEM_LIMIT = 50
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -70,6 +75,155 @@ def _output_text_for(session: ManagedSession, payload: dict[str, Any]) -> str:
     if meta.get("transport") == "tmux_terminal":
         return sanitize_terminal_output(text)
     return text
+
+
+def _transport_from_meta(meta: dict[str, Any]) -> str:
+    return str(meta.get("transport") or "")
+
+
+def _display_state_for_payload(payload: dict[str, Any]) -> str:
+    meta = payload.get("meta") or {}
+    state = str(payload.get("state") or "").strip()
+    if not state:
+        return ""
+    if _transport_from_meta(meta) in {"tmux_terminal", "cli_terminal"} and state == "idle":
+        return "waiting for input"
+    return state.replace("_", " ")
+
+
+def _truncate_text(value: str | None, *, limit: int = 160) -> str:
+    text = (value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 3].rstrip()}..."
+
+
+def _join_text(parts: list[str]) -> str:
+    return " · ".join(part for part in parts if part)
+
+
+def _dedup_detail(detail: str | None, primary: str) -> str:
+    detail_text = (detail or "").strip()
+    if not detail_text:
+        return ""
+    if primary and detail_text.casefold() == primary.casefold():
+        return ""
+    return detail_text
+
+
+def _heartbeat_group_key(payload: dict[str, Any]) -> str:
+    meta = payload.get("meta") or {}
+    signature = {
+        "state": payload.get("state"),
+        "pid": payload.get("pid"),
+        "repo_path": payload.get("repo_path"),
+        "git_branch": payload.get("git_branch"),
+        "transport": meta.get("transport"),
+        "status_detail": meta.get("status_detail"),
+        "attached_clients": meta.get("attached_clients"),
+        "pane_current_command": meta.get("pane_current_command"),
+        "last_hook_event": meta.get("last_hook_event"),
+        "codex_session_id": meta.get("codex_session_id"),
+    }
+    return json.dumps(signature, sort_keys=True, separators=(",", ":"))
+
+
+def _heartbeat_summary(payload: dict[str, Any]) -> str:
+    meta = payload.get("meta") or {}
+    state_text = _display_state_for_payload(payload)
+    status_detail = _dedup_detail(str(meta.get("status_detail") or ""), state_text)
+    attached_clients = meta.get("attached_clients")
+    attached_text = ""
+    if isinstance(attached_clients, (int, float)) and int(attached_clients) > 0:
+        attached_text = f"attached clients: {int(attached_clients)}"
+    return _join_text([state_text or "heartbeat", status_detail, attached_text])
+
+
+def _timeline_title_and_summary(event_type: str, payload: dict[str, Any]) -> tuple[str, str]:
+    meta = payload.get("meta") or {}
+    state_text = _display_state_for_payload(payload)
+    status_detail = _dedup_detail(str(meta.get("status_detail") or ""), state_text)
+    pid = payload.get("pid")
+    pid_text = f"pid {pid}" if pid is not None else ""
+    exit_code = payload.get("exit_code")
+    exit_text = f"exit {exit_code}" if exit_code is not None else ""
+
+    if event_type == "requested":
+        return "Launch requested", _truncate_text(str(payload.get("command") or payload.get("cwd") or ""))
+    if event_type == "started":
+        return "Started", _join_text([state_text or "running", pid_text])
+    if event_type == "detected":
+        return "Detected", _join_text([state_text, pid_text, _truncate_text(str(payload.get("command") or ""))])
+    if event_type == "hook_status":
+        return "Status update", _join_text([state_text, status_detail, str(meta.get("last_hook_event") or "").strip()])
+    if event_type == "approval_requested":
+        return "Approval requested", _truncate_text(str(payload.get("prompt") or "Approval requested"))
+    if event_type == "approval_resolved":
+        status_text = str(payload.get("status") or "resolved").replace("_", " ").strip()
+        return f"Approval {status_text}".title(), _truncate_text(str(payload.get("approval_id") or ""))
+    if event_type == "stopped":
+        return "Stopped", _join_text([state_text or "finished", exit_text])
+    if event_type == "failed":
+        return "Failed", _join_text([state_text or "failed", exit_text])
+    return event_type.replace("_", " ").title(), _join_text(
+        [state_text, status_detail, _truncate_text(str(payload.get("command") or ""))]
+    )
+
+
+def timeline_item_for_event(event_type: str, payload: dict[str, Any], created_at: datetime) -> dict[str, Any] | None:
+    if event_type == "output":
+        return None
+
+    created_at_iso = _as_utc(created_at).isoformat()
+    if event_type == "heartbeat":
+        return {
+            "kind": "heartbeat_rollup",
+            "event_type": event_type,
+            "title": "Heartbeat",
+            "summary": _heartbeat_summary(payload),
+            "created_at": created_at_iso,
+            "updated_at": created_at_iso,
+            "count": 1,
+            "group_key": _heartbeat_group_key(payload),
+            "raw_payload": payload,
+        }
+
+    title, summary = _timeline_title_and_summary(event_type, payload)
+    return {
+        "kind": "event",
+        "event_type": event_type,
+        "title": title,
+        "summary": summary or title,
+        "created_at": created_at_iso,
+        "updated_at": created_at_iso,
+        "count": 1,
+        "group_key": None,
+        "raw_payload": payload,
+    }
+
+
+def build_timeline_items(events: list[SessionEvent], *, limit: int = TIMELINE_ITEM_LIMIT) -> list[dict[str, Any]]:
+    timeline_items: list[dict[str, Any]] = []
+    for event in events:
+        item = timeline_item_for_event(event.event_type, event.payload or {}, event.created_at)
+        if item is None:
+            continue
+        if (
+            item["kind"] == "heartbeat_rollup"
+            and timeline_items
+            and timeline_items[-1]["kind"] == "heartbeat_rollup"
+            and timeline_items[-1]["group_key"] == item["group_key"]
+        ):
+            timeline_items[-1]["count"] = int(timeline_items[-1]["count"]) + 1
+            timeline_items[-1]["updated_at"] = item["updated_at"]
+            timeline_items[-1]["raw_payload"] = item["raw_payload"]
+            continue
+        timeline_items.append(item)
+
+    if limit > 0:
+        timeline_items = timeline_items[-limit:]
+    timeline_items.reverse()
+    return timeline_items
 
 
 def ensure_default_admin(db: Session, settings: Settings) -> None:
@@ -443,8 +597,12 @@ def get_session_detail(db: Session, session_id: str) -> dict[str, Any] | None:
         return None
 
     events = db.scalars(
-        select(SessionEvent).where(SessionEvent.session_id == session_id).order_by(SessionEvent.created_at.asc())
+        select(SessionEvent)
+        .where(SessionEvent.session_id == session_id)
+        .order_by(SessionEvent.created_at.desc(), SessionEvent.id.desc())
+        .limit(TIMELINE_RAW_EVENT_LIMIT)
     ).all()
+    events.reverse()
     approvals = db.scalars(
         select(ApprovalRequest).where(ApprovalRequest.session_id == session_id).order_by(ApprovalRequest.created_at.desc())
     ).all()
@@ -457,6 +615,7 @@ def get_session_detail(db: Session, session_id: str) -> dict[str, Any] | None:
     return {
         "session": session,
         "events": events,
+        "timeline_items": build_timeline_items(events),
         "approvals": approvals,
         "transcript_items": transcript_items,
         "lock": lock,

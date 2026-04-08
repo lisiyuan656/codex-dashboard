@@ -542,3 +542,173 @@ def test_ingest_session_transcript_is_idempotent() -> None:
     assert items[0].text == "Inspect the transcript"
     assert session.meta["transcript_status"] == "ready"
     assert session.meta["transcript_complete"] is True
+
+
+def test_get_session_detail_rolls_up_consecutive_heartbeats() -> None:
+    db = make_db()
+    now = utcnow()
+    agent = Agent(
+        id="agent-8",
+        display_name="Agent Eight",
+        hostname="host",
+        status="online",
+        last_seen_at=now,
+        labels=[],
+        meta={},
+    )
+    session = ManagedSession(
+        id="session-8",
+        agent_id="agent-8",
+        source="managed",
+        name="Timeline Session",
+        state="running",
+        command="codex --no-alt-screen",
+        cwd="/repo",
+        started_at=now,
+        last_heartbeat_at=now,
+        meta={"transport": "tmux_terminal"},
+    )
+    db.add(agent)
+    db.add(session)
+    db.commit()
+
+    for turn_id in ("turn-1", "turn-2", "turn-3"):
+        ingest_session_event(
+            db,
+            "agent-8",
+            {
+                "session_id": "session-8",
+                "event_type": "heartbeat",
+                "state": "running",
+                "pid": 777,
+                "repo_path": "/repo",
+                "git_branch": "main",
+                "meta": {
+                    "transport": "tmux_terminal",
+                    "attached_clients": 0,
+                    "pane_current_command": "codex",
+                    "status_detail": "",
+                    "last_hook_event": None,
+                    "codex_session_id": "codex-session",
+                    "thread_id": "thread-a",
+                    "turn_id": turn_id,
+                },
+            },
+        )
+
+    ingest_session_event(
+        db,
+        "agent-8",
+        {
+            "session_id": "session-8",
+            "event_type": "output",
+            "state": "running",
+            "pid": 777,
+            "text": "working",
+            "meta": {
+                "transport": "tmux_terminal",
+                "pane_current_command": "codex",
+            },
+        },
+    )
+    ingest_session_event(
+        db,
+        "agent-8",
+        {
+            "session_id": "session-8",
+            "event_type": "heartbeat",
+            "state": "running",
+            "pid": 777,
+            "repo_path": "/repo",
+            "git_branch": "main",
+            "meta": {
+                "transport": "tmux_terminal",
+                "attached_clients": 2,
+                "pane_current_command": "codex",
+                "status_detail": "",
+                "last_hook_event": None,
+                "codex_session_id": "codex-session",
+                "thread_id": "thread-b",
+                "turn_id": "turn-4",
+            },
+        },
+    )
+    ingest_session_event(
+        db,
+        "agent-8",
+        {
+            "session_id": "session-8",
+            "event_type": "stopped",
+            "state": "finished",
+            "exit_code": 0,
+            "meta": {"transport": "tmux_terminal"},
+        },
+    )
+
+    detail = get_session_detail(db, "session-8")
+
+    assert detail is not None
+    assert len(detail["timeline_items"]) == 3
+    assert [item["event_type"] for item in detail["timeline_items"]] == ["stopped", "heartbeat", "heartbeat"]
+    assert detail["timeline_items"][1]["kind"] == "heartbeat_rollup"
+    assert detail["timeline_items"][1]["count"] == 1
+    assert detail["timeline_items"][1]["summary"] == "running · attached clients: 2"
+    assert detail["timeline_items"][2]["kind"] == "heartbeat_rollup"
+    assert detail["timeline_items"][2]["count"] == 3
+    assert detail["timeline_items"][2]["summary"] == "running"
+
+
+def test_get_session_detail_limits_recent_events_and_timeline_items() -> None:
+    db = make_db()
+    now = utcnow()
+    agent = Agent(
+        id="agent-9",
+        display_name="Agent Nine",
+        hostname="host",
+        status="online",
+        last_seen_at=now,
+        labels=[],
+        meta={},
+    )
+    session = ManagedSession(
+        id="session-9",
+        agent_id="agent-9",
+        source="managed",
+        name="Large Timeline Session",
+        state="running",
+        command="codex --no-alt-screen",
+        cwd="/repo",
+        started_at=now,
+        last_heartbeat_at=now,
+        meta={"transport": "tmux_terminal"},
+    )
+    db.add(agent)
+    db.add(session)
+    db.commit()
+
+    for index in range(210):
+        ingest_session_event(
+            db,
+            "agent-9",
+            {
+                "session_id": "session-9",
+                "event_type": "hook_status",
+                "state": "running",
+                "pid": 1234,
+                "meta": {
+                    "transport": "tmux_terminal",
+                    "status_detail": f"Step {index}",
+                    "last_hook_event": f"Hook {index}",
+                },
+            },
+        )
+
+    detail = get_session_detail(db, "session-9")
+
+    assert detail is not None
+    assert len(detail["events"]) == 200
+    assert detail["events"][0].payload["meta"]["status_detail"] == "Step 10"
+    assert detail["events"][-1].payload["meta"]["status_detail"] == "Step 209"
+    assert len(detail["timeline_items"]) == 50
+    assert detail["timeline_items"][0]["summary"] == "running · Step 209 · Hook 209"
+    assert detail["timeline_items"][-1]["summary"] == "running · Step 160 · Hook 160"

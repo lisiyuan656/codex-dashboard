@@ -169,6 +169,62 @@ button.danger {
   flex-wrap: wrap;
 }
 
+.timeline-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.timeline-item {
+  padding: 0.85rem 0.95rem;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(2, 6, 23, 0.62);
+}
+
+.timeline-heartbeat_rollup {
+  border-color: rgba(56, 189, 248, 0.28);
+}
+
+.timeline-item-header {
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.4rem;
+}
+
+.timeline-summary {
+  margin: 0;
+  color: var(--text);
+  font-family: "IBM Plex Mono", monospace;
+  white-space: pre-wrap;
+}
+
+.timeline-meta {
+  margin: 0.45rem 0 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.timeline-details {
+  margin-top: 0.65rem;
+}
+
+.timeline-details summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.timeline-payload {
+  min-height: 0;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  padding: 0.85rem;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(2, 6, 23, 0.9);
+  font-family: "IBM Plex Mono", monospace;
+}
+
 .transcript-list {
   display: grid;
   gap: 0.75rem;

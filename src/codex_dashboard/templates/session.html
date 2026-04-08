@@ -7,6 +7,11 @@
     <h1 style="margin: 0;">{{ session.name }}</h1>
     <span class="pill status-{{ session.state }}" id="state-badge">{{ display_session_state(session) }}</span>
     <span class="pill">{{ transport }}</span>
+    {% if session.last_heartbeat_at %}
+    <span class="pill" id="last-heartbeat">Last heartbeat {{ session.last_heartbeat_at }}</span>
+    {% else %}
+    <span class="pill" id="last-heartbeat" hidden></span>
+    {% endif %}
   </div>
   <p class="meta">{{ session.command }}</p>
   <p class="meta">CWD: {{ session.cwd }}</p>
@@ -109,37 +114,32 @@
 
 <div class="card" style="margin-top: 1rem;">
   <h2>Timeline</h2>
-  <div class="grid" id="event-list">
-    {% for event in detail.events[-20:] %}
-    <div class="card">
-      <div class="toolbar">
-        <strong>{{ event.event_type }}</strong>
-        <span class="pill">{{ event.created_at }}</span>
-      </div>
-      <pre class="session-output" style="min-height: 80px;">{{ event.payload | tojson(indent=2) }}</pre>
-    </div>
-    {% endfor %}
-  </div>
+  <p class="meta" id="timeline-empty"{% if timeline_items %} hidden{% endif %}>No recent session activity.</p>
+  <div class="timeline-list" id="event-list"></div>
 </div>
 
 <script>
   const sessionId = "{{ session.id }}";
   const sessionName = {{ session.name | tojson }};
   const sessionOutput = document.getElementById("session-output");
-  const eventList = document.getElementById("event-list");
+  const timelineList = document.getElementById("event-list");
+  const timelineEmpty = document.getElementById("timeline-empty");
   const lockState = document.getElementById("lock-state");
   const lockButton = document.getElementById("lock-button");
   const inputBox = document.getElementById("input-box");
   const stateBadge = document.getElementById("state-badge");
   const statusDetail = document.getElementById("status-detail");
+  const lastHeartbeat = document.getElementById("last-heartbeat");
   const transport = "{{ transport }}";
   const transcriptList = document.getElementById("transcript-list");
   const transcriptEmpty = document.getElementById("transcript-empty");
   const transcriptStatus = document.getElementById("transcript-status");
   const refreshTranscriptButton = document.getElementById("refresh-transcript-button");
+  const initialTimelineItems = {{ timeline_items | tojson }};
   const initialTranscriptItems = {{ transcript_items | tojson }};
   const initialTranscriptState = {{ transcript_state | tojson }};
   const seenTranscriptKeys = new Set();
+  const timelineLimit = 50;
 
   function sanitizeTerminalOutput(text) {
     return text
@@ -169,17 +169,176 @@
 
   sessionOutput.textContent = sanitizeTerminalOutput(sessionOutput.textContent);
 
-  function prependEvent(title, payload) {
-    const card = document.createElement("div");
-    card.className = "card";
-    card.innerHTML = `
-      <div class="toolbar">
-        <strong>${escapeHtml(title)}</strong>
-        <span class="pill">${new Date().toISOString()}</span>
+  function truncateText(text, limit = 160) {
+    const value = String(text || "").trim();
+    if (value.length <= limit) {
+      return value;
+    }
+    return `${value.slice(0, limit - 3).trimEnd()}...`;
+  }
+
+  function timelineTimestamp(item) {
+    if (!item) return "";
+    if (item.kind === "heartbeat_rollup") {
+      return item.updated_at || item.created_at || "";
+    }
+    return item.created_at || "";
+  }
+
+  function timelineRangeText(item) {
+    if (!item || item.kind !== "heartbeat_rollup") {
+      return "";
+    }
+    const count = Number(item.count || 1);
+    if (count <= 1) {
+      return "";
+    }
+    return `${count} heartbeats from ${item.created_at || ""} to ${item.updated_at || item.created_at || ""}`;
+  }
+
+  function timelineDetailText(item) {
+    const rawPayload = item?.raw_payload || {};
+    if (Object.keys(rawPayload).length === 0) {
+      return "";
+    }
+    return JSON.stringify(rawPayload, null, 2);
+  }
+
+  function createTimelineItem(item) {
+    const article = document.createElement("article");
+    article.className = `timeline-item timeline-${item.kind}`;
+    article.dataset.kind = item.kind || "event";
+    article.dataset.groupKey = item.group_key || "";
+    article._timelineItem = {
+      ...item,
+      count: Number(item.count || 1),
+    };
+    const detailText = timelineDetailText(item);
+    const rangeText = timelineRangeText(item);
+    const count = Number(item.count || 1);
+    article.innerHTML = `
+      <div class="toolbar timeline-item-header">
+        <div class="inline-list">
+          <strong>${escapeHtml(item.title || item.event_type || "Event")}</strong>
+          ${item.kind === "heartbeat_rollup" && count > 1 ? `<span class="pill">${escapeHtml(`${count}x`)}</span>` : ""}
+        </div>
+        <span class="pill">${escapeHtml(timelineTimestamp(item))}</span>
       </div>
-      <pre class="session-output" style="min-height: 80px;">${escapeHtml(JSON.stringify(payload, null, 2))}</pre>
+      <p class="timeline-summary">${escapeHtml(item.summary || "")}</p>
+      ${rangeText ? `<p class="timeline-meta">${escapeHtml(rangeText)}</p>` : ""}
+      ${detailText ? `<details class="timeline-details"><summary>Raw payload</summary><pre class="timeline-payload">${escapeHtml(detailText)}</pre></details>` : ""}
     `;
-    eventList.prepend(card);
+    return article;
+  }
+
+  function updateTimelineEmptyState() {
+    timelineEmpty.hidden = timelineList.children.length > 0;
+  }
+
+  function capTimeline() {
+    while (timelineList.children.length > timelineLimit) {
+      timelineList.lastElementChild?.remove();
+    }
+  }
+
+  function renderTimeline(items) {
+    timelineList.textContent = "";
+    for (const item of items || []) {
+      if (!item) continue;
+      timelineList.appendChild(createTimelineItem(item));
+    }
+    capTimeline();
+    updateTimelineEmptyState();
+  }
+
+  function mergeTimelineItems(existing, incoming) {
+    return {
+      ...existing,
+      count: Number(existing.count || 1) + Number(incoming.count || 1),
+      updated_at: incoming.updated_at || incoming.created_at || existing.updated_at || existing.created_at,
+      raw_payload: incoming.raw_payload || existing.raw_payload,
+      summary: incoming.summary || existing.summary,
+    };
+  }
+
+  function replaceTimelineElement(element, item) {
+    const replacement = createTimelineItem(item);
+    element.replaceWith(replacement);
+    return replacement;
+  }
+
+  function prependTimelineItem(item) {
+    if (!item) return;
+    const first = timelineList.firstElementChild;
+    if (
+      item.kind === "heartbeat_rollup" &&
+      first &&
+      first.dataset.kind === "heartbeat_rollup" &&
+      first.dataset.groupKey === String(item.group_key || "")
+    ) {
+      replaceTimelineElement(first, mergeTimelineItems(first._timelineItem || {}, item));
+      updateTimelineEmptyState();
+      return;
+    }
+    timelineList.prepend(createTimelineItem(item));
+    capTimeline();
+    updateTimelineEmptyState();
+  }
+
+  function createSyntheticTimelineItem(eventType, rawPayload) {
+    const createdAt = new Date().toISOString();
+    switch (eventType) {
+      case "input":
+        return {
+          kind: "event",
+          event_type: eventType,
+          title: "Input sent",
+          summary: truncateText(rawPayload?.input || ""),
+          created_at: createdAt,
+          updated_at: createdAt,
+          count: 1,
+          group_key: null,
+          raw_payload: rawPayload || {},
+        };
+      case "enter":
+        return {
+          kind: "event",
+          event_type: eventType,
+          title: "Enter sent",
+          summary: "Submitted an Enter keypress.",
+          created_at: createdAt,
+          updated_at: createdAt,
+          count: 1,
+          group_key: null,
+          raw_payload: rawPayload || {},
+        };
+      case "interrupt":
+        return {
+          kind: "event",
+          event_type: eventType,
+          title: "Interrupt sent",
+          summary: "Sent Ctrl-C to the session.",
+          created_at: createdAt,
+          updated_at: createdAt,
+          count: 1,
+          group_key: null,
+          raw_payload: rawPayload || {},
+        };
+      case "stop":
+        return {
+          kind: "event",
+          event_type: eventType,
+          title: "Stop requested",
+          summary: "Requested session stop.",
+          created_at: createdAt,
+          updated_at: createdAt,
+          count: 1,
+          group_key: null,
+          raw_payload: rawPayload || {},
+        };
+      default:
+        return null;
+    }
   }
 
   function displayState(summary) {
@@ -194,6 +353,13 @@
     if (!summary) return;
     stateBadge.textContent = displayState(summary);
     stateBadge.className = `pill status-${summary.state}`;
+    if (summary.last_heartbeat_at) {
+      lastHeartbeat.hidden = false;
+      lastHeartbeat.textContent = `Last heartbeat ${summary.last_heartbeat_at}`;
+    } else {
+      lastHeartbeat.hidden = true;
+      lastHeartbeat.textContent = "";
+    }
     const detail = (summary.meta || {}).status_detail;
     if (detail) {
       statusDetail.hidden = false;
@@ -321,6 +487,7 @@
     button.addEventListener("click", () => activatePanel(button.dataset.panel));
   });
 
+  renderTimeline(initialTimelineItems);
   appendTranscriptItems(initialTranscriptItems);
   updateTranscriptState(initialTranscriptState);
 
@@ -381,7 +548,7 @@
       const input = inputBox.value;
       if (!input) return;
       await postJson(`/api/sessions/${sessionId}/actions`, { type: "send_input", input });
-      prependEvent("input", { input });
+      prependTimelineItem(createSyntheticTimelineItem("input", { input }));
       inputBox.value = "";
     } catch (error) {
       alert(error.message);
@@ -391,7 +558,7 @@
   document.getElementById("enter-button")?.addEventListener("click", async () => {
     try {
       await postJson(`/api/sessions/${sessionId}/actions`, { type: "send_enter" });
-      prependEvent("enter", {});
+      prependTimelineItem(createSyntheticTimelineItem("enter", {}));
     } catch (error) {
       alert(error.message);
     }
@@ -400,7 +567,7 @@
   document.getElementById("interrupt-button")?.addEventListener("click", async () => {
     try {
       await postJson(`/api/sessions/${sessionId}/actions`, { type: "interrupt_session" });
-      prependEvent("interrupt", {});
+      prependTimelineItem(createSyntheticTimelineItem("interrupt", {}));
     } catch (error) {
       alert(error.message);
     }
@@ -425,7 +592,7 @@
   document.getElementById("stop-button")?.addEventListener("click", async () => {
     try {
       await postJson(`/api/sessions/${sessionId}/actions`, { type: "stop_session" });
-      prependEvent("stop", {});
+      prependTimelineItem(createSyntheticTimelineItem("stop", {}));
     } catch (error) {
       alert(error.message);
     }
@@ -438,13 +605,14 @@
   function handleSocketMessage(event) {
     const payload = JSON.parse(event.data);
     if (payload.type === "history_batch") {
+      renderTimeline(payload.items || []);
       return;
     }
     if (payload.type === "session_event") {
       if (payload.event_type === "output" && payload.payload.text) {
         appendOutput(payload.payload.text);
-      } else {
-        prependEvent(payload.event_type, payload.payload);
+      } else if (payload.timeline_item) {
+        prependTimelineItem(payload.timeline_item);
       }
       if (payload.summary) {
         updateSummary(payload.summary);
